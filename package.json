@@ -6,7 +6,8 @@
   "author": "Stanley Projects",
   "scripts": {
     "start": "unset ELECTRON_RUN_AS_NODE && electron .",
-    "build": "electron-builder --win"
+    "build": "electron-builder --win",
+    "test": "node --test"
   },
   "dependencies": {},
   "devDependencies": {
@@ -26,14 +27,16 @@
       "index.html",
       "styles.css",
       "agent-hook.js",
+      "hook-bridge.js",
+      "session-store.js",
       "assets/tray-active.png",
       "assets/tray-inactive.png",
       "assets/icon.png",
       "assets/icon.ico"
     ],
-
     "asarUnpack": [
-      "agent-hook.js"
+      "agent-hook.js",
+      "session-store.js"
     ],
     "win": {
       "target": "nsis",

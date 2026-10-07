@@ -21,7 +21,7 @@ When AI coding tools like Claude Code or Aider run long tasks, the PC can fall a
 ## Features (complete list)
 
 ### Smart AI integrations
-- **Claude Code**: Hook-based via `~/.claude/settings.json`. Events: `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification` → stay awake; `SessionEnd` → allow sleep.
+- **Claude Code**: Hook-based via `~/.claude/settings.json` (terminal and VS Code extension). Events: `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest` → activity; `Stop`, `StopFailure` → turn over; `SessionEnd` → session gone. A running tool call keeps the PC awake up to 30 minutes. Dev containers: the `claude-code-stay-awake` Dev Container Feature reports to Insomnia's loopback bridge (`host.docker.internal:47391`) with a heartbeat while a turn is open.
 - **Cursor**: Polls `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` every 5 seconds. Files written during active Agent sessions; stays awake while any transcript changes.
 - **OpenAI Codex**: Dual-path. CLI uses `notify = ["node", "<hook>", "stay-awake", "codex-cli"]` in `~/.codex/config.toml`. VS Code extension and standalone app use session transcript polling at `~/.codex/sessions/**/*.jsonl`.
 

@@ -1,0 +1,26 @@
+{
+  "id": "claude-code-stay-awake",
+  "version": "1.0.0",
+  "name": "Insomnia: keep the host awake for Claude Code",
+  "description": "Tells Insomnia on your Windows host when Claude Code in this container is working, so the PC doesn't fall asleep mid-task.",
+  "documentationURL": "https://github.com/stanley-projects/Insomnia/tree/master/devcontainer-features/src/claude-code-stay-awake",
+  "licenseURL": "https://github.com/stanley-projects/Insomnia/blob/master/LICENSE",
+  "keywords": ["claude", "claude-code", "sleep", "insomnia", "windows"],
+  "options": {
+    "hostAddress": {
+      "type": "string",
+      "default": "host.docker.internal",
+      "proposals": ["host.docker.internal", "host.containers.internal"],
+      "description": "Host name (or IPv4 address) the container uses to reach the PC running Insomnia."
+    },
+    "bridgePort": {
+      "type": "string",
+      "default": "47391",
+      "description": "Port of Insomnia's dev container bridge. Change only if you set bridgePort in Insomnia's config.json."
+    }
+  },
+  "installsAfter": [
+    "ghcr.io/devcontainers/features/common-utils",
+    "ghcr.io/anthropics/devcontainer-features/claude-code"
+  ]
+}

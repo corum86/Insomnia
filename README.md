@@ -30,7 +30,7 @@ Insomnia has built-in support for AI coding tools with two types of monitoring:
 
 | Integration | Type | How It Works |
 |---|---|---|
-| **Claude Code** | Hook-based | Knows when Claude is *actively working* (not just open). Wakes on tool use, sleeps when idle. |
+| **Claude Code** | Hook-based | Knows when Claude is *actively working* (not just open) — in the terminal, the VS Code extension, or a dev container. Stays awake through long builds, sleeps when the turn ends. |
 | **Cursor** | Hook-based | Knows when Cursor Agent is *actively working*. Polls agent transcripts; idle = asleep. |
 | **Aider** | Process-based | Keeps awake while `aider.exe` is running |
 | **OpenAI Codex** | Hook-based | Knows when Codex is *actively working* (CLI, VS Code, or desktop). Uses Codex's `notify` config plus Codex session activity to track active work. |
@@ -102,18 +102,46 @@ Insomnia uses Electron's `powerSaveBlocker` API to prevent Windows from entering
 
 1. **Manual toggle** — User explicitly wants the PC awake
 2. **Process monitoring** — Polls `tasklist` every 10 seconds to check if watched apps are running
-3. **Hook-based sessions** — For tools like Claude Code, lightweight hooks signal activity to a shared session file (`~/.insomnia/agent-sessions.json`). A Claude Code session ends when its `Stop` hook fires; otherwise it expires after 3 minutes of silence, or up to 30 minutes while `claude.exe` is still alive and a turn is still open.
+3. **Hook-based sessions** — For tools like Claude Code, lightweight hooks signal activity to a shared session file (`~/.insomnia/agent-sessions.json`). A Claude Code session is released the moment its turn ends (`Stop`); otherwise after 3 minutes of silence, or — up to 30 minutes — while a tool call is still running and Claude is still alive.
 
 If *any* trigger is active, the PC stays awake. When *all* triggers go inactive, normal sleep behavior resumes.
 
 ### Claude Code Integration Details
 
-When you enable the Claude Code integration, Insomnia adds hooks to `~/.claude/settings.json` that fire on:
+Works in the terminal, in the **VS Code extension**, and inside a **dev container** (see below). When you enable the Claude Code integration, Insomnia adds hooks to `~/.claude/settings.json` that fire on:
 
-- `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification` → signal activity (stay awake)
-- `SessionEnd` → signal idle (allow sleep)
+- `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest` → activity (stay awake)
+- `Stop`, `StopFailure` → the turn is over (allow sleep); `SessionEnd` → the session is gone
+
+Each hook says which event fired, so Insomnia follows the turn rather than guessing from silence:
+
+- **Any hook in the last 3 minutes** keeps the PC awake.
+- **A tool call still running** (a `PreToolUse` with no `PostToolUse` yet — a 10-minute build, a long test run) keeps it awake for up to 30 minutes, as long as Claude itself is still running. No hook fires while a tool runs, so this is what protects long builds.
+- **A long reply with no tool calls** is covered the same way once the session has shown it reports the end of its turns with `Stop`.
+- **`Stop` releases immediately.** If a host never sends `Stop` (it has been reported missing in the VS Code extension), the session simply lets go 3 minutes after Claude's last action instead of hanging on.
+
+The hooks are written in Claude Code's exec form (`command` + `args`, which needs Claude Code 2.1.139 or newer), so they run the same whether Claude Code would have used Git Bash or PowerShell. Earlier builds wrote a plain command line, which PowerShell — Claude Code's fallback when Git Bash isn't installed, common with the VS Code extension — could not parse, so no Insomnia hook ever ran there.
 
 This means your PC stays awake precisely while Claude is doing work — reading files, running commands, writing code — and goes back to normal the moment it stops. No wasted power, no interrupted sessions.
+
+### Claude Code in a Dev Container
+
+Inside a dev container Claude Code runs in Linux, so its hooks can't reach the Windows hook or `%USERPROFILE%\.insomnia`, and Windows can't see the `claude` process. Two pieces close that gap:
+
+1. **Insomnia listens on `127.0.0.1:47391`** while the Claude Code integration is on. Docker Desktop makes this reachable from containers as `host.docker.internal`. It only accepts JSON from programs (requests from web pages are refused) and is never exposed to your network.
+2. **The `claude-code-stay-awake` Dev Container Feature** installs a small hook in the container. It forwards Claude Code's hook events to Insomnia and, while a turn is open, sends a heartbeat every minute so a long build inside the container keeps the PC awake — and a container that has stopped lets it sleep.
+
+Add the feature to your `.devcontainer/devcontainer.json`:
+
+```jsonc
+"features": {
+  "ghcr.io/stanley-projects/insomnia/claude-code-stay-awake:1": {}
+}
+```
+
+Or, before it's published, copy [`devcontainer-features/src/claude-code-stay-awake`](devcontainer-features/src/claude-code-stay-awake) into your `.devcontainer/` folder and use `"./claude-code-stay-awake": {}`. To get it in every dev container without editing each repo, add it to VS Code's `dev.containers.defaultFeatures` setting. See the [feature's README](devcontainer-features/src/claude-code-stay-awake/README.md) for options, firewalled containers, and troubleshooting.
+
+The tray then shows *"Staying awake for — Claude Code (dev container)"*.
 
 ### Cursor Integration Details
 
@@ -130,6 +158,7 @@ Settings are stored in your Electron user data directory and persist across rest
 - **Watched apps** — list of executables to monitor, each with an enable/disable toggle
 - **Watched integrations** — AI tools with their monitoring type and enabled state
 - **Manual awake state** — remembered across restarts
+- **`bridgePort`** (optional, edit `%APPDATA%\insomnia-app\config.json`) — port for the dev container bridge, default `47391`. If you change it, set the feature's `bridgePort` option to match.
 
 ## Screenshots
 
@@ -171,7 +200,7 @@ Setting your screen timeout to "Never" or 2+ hours works, but then your PC never
 Install Insomnia and add a trigger — an AI integration, a watched app, or the manual toggle. Insomnia uses Electron's `powerSaveBlocker` API to suppress the Windows sleep timer precisely while a trigger is active.
 
 **Does Insomnia work with Claude Code?**  
-Yes. Enable the Claude Code integration and Insomnia hooks into `~/.claude/settings.json`. Your PC wakes when Claude starts working and sleeps within 3 minutes after it goes idle.
+Yes — in the terminal, in the VS Code extension, and inside a dev container. Enable the Claude Code integration and Insomnia hooks into `~/.claude/settings.json`; for dev containers also add the `claude-code-stay-awake` Dev Container Feature. Your PC stays awake while Claude works (including long builds) and is released when the turn ends.
 
 **Does Insomnia work with Cursor?**  
 Yes. Insomnia polls `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` every 5 seconds. These files are only written during active Cursor Agent sessions, so the PC stays awake only while the Agent is working — not just because Cursor is open.

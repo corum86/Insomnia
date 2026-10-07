@@ -3,77 +3,58 @@
 /**
  * Lightweight hook handler for Insomnia integrations.
  * Called by Claude Code hooks (and similar tools) to signal activity.
- * No Electron dependency — just reads stdin and writes to a JSON file.
+ * No Electron dependency — reads the hook's JSON from stdin and records it in
+ * ~/.insomnia/agent-sessions.json (see session-store.js for the rules).
  *
  * Usage:
- *   echo '{"session_id":"abc"}' | node agent-hook.js stay-awake <integration-id>
- *   echo '{"session_id":"abc"}' | node agent-hook.js allow-sleep <integration-id>
+ *   echo '{"session_id":"abc","hook_event_name":"PreToolUse","tool_use_id":"t1"}' | node agent-hook.js stay-awake <integration-id>
+ *   echo '{"session_id":"abc","hook_event_name":"Stop"}' | node agent-hook.js allow-sleep <integration-id>
+ *
+ * Claude Code passes the event name in the JSON, so the event decides what
+ * happens; the command is only a fallback for tools that do not send one.
+ *
+ * A hook must never get in the agent's way: no stdout, always exit 0.
  */
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-
-const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
-const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
+const store = require('./session-store');
 
 const command = process.argv[2];
 const integrationId = process.argv[3] || 'unknown';
 
-function readSessions() {
-  try {
-    if (fs.existsSync(SESSIONS_FILE)) {
-      return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
-    }
-  } catch {}
-  return { sessions: {} };
-}
-
-function writeSessions(data) {
-  if (!fs.existsSync(SESSIONS_DIR)) {
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-  }
-  data.last_updated = new Date().toISOString();
-  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
-}
-
 function readStdin() {
   return new Promise((resolve) => {
     let data = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => { data += chunk; });
-    process.stdin.on('end', () => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
       try { resolve(JSON.parse(data)); }
       catch { resolve({}); }
-    });
-    // Timeout after 1 second if no stdin
-    setTimeout(() => resolve({}), 1000);
+    };
+    try {
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', chunk => { data += chunk; });
+      process.stdin.on('end', finish);
+      process.stdin.on('error', finish);
+    } catch {
+      finish();
+    }
+    // Some callers (Codex notify) never close stdin — don't wait forever.
+    setTimeout(finish, 1000);
   });
 }
 
 async function main() {
   const input = await readStdin();
-  const sessionId = input.session_id || 'default';
-  const key = `${integrationId}:${sessionId}`;
-
-  const sessions = readSessions();
-
-  if (command === 'stay-awake') {
-    if (!sessions.sessions[key]) {
-      sessions.sessions[key] = {
-        integration: integrationId,
-        session_id: sessionId,
-        created_at: new Date().toISOString()
-      };
-    }
-    sessions.sessions[key].last_activity = new Date().toISOString();
-    writeSessions(sessions);
-  } else if (command === 'allow-sleep') {
-    delete sessions.sessions[key];
-    writeSessions(sessions);
-  }
-
+  try {
+    store.updateSessions(data => store.applyHookEvent(data, {
+      integration: integrationId,
+      command,
+      input,
+      origin: 'local'
+    }));
+  } catch {}
   process.exit(0);
 }
 
-main();
+main().catch(() => process.exit(0));

@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execFile, spawn } = require('child_process');
+const store = require('./session-store');
+const { createHookBridge, DEFAULT_BRIDGE_PORT } = require('./hook-bridge');
 
 // ── State ──────────────────────────────────────────────────────────────────────
 let mainWindow = null;
@@ -16,6 +18,11 @@ let activeIntegrations = [];
 let config = { manualAwake: false, watchedApps: [], watchedIntegrations: [] };
 let processLastSeen = {}; // integrationId → timestamp, for process-based grace period
 let appLastSeen = {};     // exe.toLowerCase() → timestamp, for watched apps grace period
+// Last tasklist output. Session checks triggered by a hook (file watcher, dev
+// container bridge) reuse it rather than assuming no process is running — that
+// assumption dropped the long-tool-call grace for up to 10s on every hook.
+let lastTasklistLower = '';
+let hookBridge = null;
 
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
 const ASSETS = path.join(__dirname, 'assets');
@@ -23,22 +30,17 @@ const ASSETS = path.join(__dirname, 'assets');
 const HOOK_SCRIPT = app.isPackaged
   ? path.join(__dirname.replace('app.asar', 'app.asar.unpacked'), 'agent-hook.js')
   : path.join(__dirname, 'agent-hook.js');
-const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
-const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
+const { SESSIONS_DIR, SESSIONS_FILE, SESSION_TIMEOUT_MS } = store;
 // Hook launcher: a tiny .cmd shim so hooks never depend on the user having Node
 // installed. It runs the app's own bundled Electron binary in Node mode, so a
 // fresh install works on a machine with no Node runtime at all.
 const HOOK_LAUNCHER = path.join(SESSIONS_DIR, 'insomnia-hook.cmd');
-const SESSION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes — timeout between hook events
+// Hook-based integrations without turn tracking (Codex, Cursor): while their
+// process is alive, a session stays awake this long after its last activity.
 const SESSION_PROCESS_GRACE_MS = 5 * 60 * 1000; // 5 minutes — covers long AI responses with no tool calls
-// Integrations that tell us explicitly when a turn ends (Claude Code's Stop hook)
-// get a much longer grace while a turn is still open. Nothing fires during a
-// single long tool call — a 10-minute build or test run — so the old 5-minute
-// grace expired mid-work and the machine slept during exactly the workload this
-// app exists to protect. Safe to be generous here only because the Stop hook
-// deletes the session the moment the turn finishes, so an idle session does not
-// sit on this timer.
-const SESSION_TURN_GRACE_MS = 30 * 60 * 1000; // 30 minutes — long tool call still running
+// Claude Code reports turns and tool calls explicitly, so it uses the
+// turn-aware rules in session-store.js instead (3 min after any hook, up to
+// 30 min while a tool call is still running or an open turn can be trusted).
 const PROCESS_GRACE_MS = 30 * 1000; // 30 seconds — grace period for process-based integrations/apps after process disappears
 
 // ── Available Integrations ─────────────────────────────────────────────────────
@@ -46,11 +48,15 @@ const INTEGRATIONS = [
   {
     id: 'claude-code',
     name: 'Claude Code',
-    description: 'Keeps PC awake while Claude is actively working on tasks',
+    description: 'Keeps PC awake while Claude is actively working (terminal, VS Code, or a dev container)',
     hookBased: true,
-    // Claude Code fires a Stop hook at the end of every turn, so we are told when
-    // work finishes instead of inferring it from silence.
+    // Claude Code's hooks report turns (UserPromptSubmit … Stop) and tool calls
+    // (PreToolUse / PostToolUse), so sessions are judged turn by turn — see
+    // isTurnSessionActive() in session-store.js — instead of by silence alone.
     endOfTurnSignal: true,
+    // The terminal CLI and the VS Code extension (its bundled
+    // resources\native-binary\claude.exe) both show up as claude.exe. Sessions in
+    // a dev container are not visible here; they prove liveness by heartbeat.
     processNames: ['claude.exe'],
     icon: 'claude'
   },
@@ -244,6 +250,7 @@ function checkRunningProcesses() {
   proc.stdout.on('data', d => { output += d.toString(); });
   proc.on('close', () => {
     const lower = output.toLowerCase();
+    lastTasklistLower = lower;
 
     // Check apps — with 30s grace period so a brief disappearance doesn't instantly deactivate
     const now = Date.now();
@@ -283,7 +290,10 @@ function checkRunningProcesses() {
 }
 
 // ── Agent Session Monitoring (Hook-based integrations) ─────────────────────────
-function checkAgentSessions(tasklistLower) {
+// Where a session is running, for the tray tooltip.
+const ORIGIN_LABELS = { devcontainer: 'dev container', wsl: 'WSL', remote: 'remote' };
+
+function checkAgentSessions(tasklistLower = lastTasklistLower) {
   const hookIntegrations = config.watchedIntegrations
     .filter(i => i.enabled)
     .map(i => INTEGRATIONS.find(def => def.id === i.id))
@@ -303,32 +313,35 @@ function checkAgentSessions(tasklistLower) {
       return;
     }
 
-    const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+    const data = store.readSessions(SESSIONS_FILE);
     const now = Date.now();
 
     for (const def of hookIntegrations) {
-      // Check if any session for this integration has recent hook activity
-      const hasRecentHook = Object.values(data.sessions || {}).some(s => {
-        if (s.integration !== def.id) return false;
-        const lastActivity = new Date(s.last_activity).getTime();
-        return (now - lastActivity) < SESSION_TIMEOUT_MS;
-      });
+      const sessions = Object.values(data.sessions || {}).filter(s => s && s.integration === def.id);
 
-      // Check if the process is still running (covers background tasks / idle gaps)
+      // Is the integration's process running on this PC? (Covers long tool
+      // calls and replies, during which no hook fires.)
       const processAlive = def.processNames && tasklistLower
         ? def.processNames.some(p => tasklistLower.includes(p.toLowerCase()))
         : false;
 
-      // If the process is alive, allow a longer grace period (long tool calls,
-      // background builds). Integrations that release explicitly at end of turn
-      // can be given a much longer one: a session only survives here while its
-      // turn is genuinely still open.
-      const graceMs = def.endOfTurnSignal ? SESSION_TURN_GRACE_MS : SESSION_PROCESS_GRACE_MS;
-      const withinGracePeriod = Object.values(data.sessions || {}).some(s => {
-        if (s.integration !== def.id) return false;
-        const lastActivity = new Date(s.last_activity).getTime();
-        return (now - lastActivity) < graceMs;
-      });
+      if (def.endOfTurnSignal) {
+        // Claude Code: judged session by session, wherever it runs. Local
+        // sessions borrow claude.exe's liveness; dev container sessions carry
+        // their own heartbeat.
+        const active = sessions.filter(s => store.isTurnSessionActive(s, now, processAlive));
+        if (active.length > 0) {
+          const remoteOnly = active.every(s => store.isRemoteSession(s));
+          const where = remoteOnly ? (ORIGIN_LABELS[active[0].origin] || ORIGIN_LABELS.remote) : '';
+          activeIntegrations.push({ id: def.id, name: where ? `${def.name} (${where})` : def.name, reason: 'hook' });
+        }
+        continue;
+      }
+
+      // Everything else: recent activity, or a grace period while the process lives.
+      const lastActivities = sessions.map(s => new Date(s.last_activity).getTime()).filter(Number.isFinite);
+      const hasRecentHook = lastActivities.some(t => (now - t) < SESSION_TIMEOUT_MS);
+      const withinGracePeriod = lastActivities.some(t => (now - t) < SESSION_PROCESS_GRACE_MS);
 
       if (hasRecentHook || (processAlive && withinGracePeriod)) {
         activeIntegrations.push({ id: def.id, name: def.name, reason: 'hook' });
@@ -343,6 +356,15 @@ function checkAgentSessions(tasklistLower) {
 let sessionWatcher = null;
 let watchDebounce = null;
 
+// Debounced re-check — hooks can fire in rapid succession.
+function scheduleSessionCheck() {
+  if (watchDebounce) clearTimeout(watchDebounce);
+  watchDebounce = setTimeout(() => {
+    watchDebounce = null;
+    checkAgentSessions();
+  }, 200);
+}
+
 function watchSessionFile() {
   // Ensure the directory and file exist before watching
   if (!fs.existsSync(SESSIONS_DIR)) {
@@ -353,12 +375,13 @@ function watchSessionFile() {
   }
 
   try {
-    sessionWatcher = fs.watch(SESSIONS_FILE, () => {
-      // Debounce — hooks can fire in rapid succession
-      if (watchDebounce) clearTimeout(watchDebounce);
-      watchDebounce = setTimeout(() => {
-        checkAgentSessions();
-      }, 200);
+    // Watch the folder, not the file: hooks now replace the file atomically
+    // (write a temp file, rename it over), and a watch on the old file would go
+    // quiet after the first replace on some platforms.
+    const sessionsName = path.basename(SESSIONS_FILE);
+    sessionWatcher = fs.watch(SESSIONS_DIR, (_event, filename) => {
+      if (filename && filename.toString() !== sessionsName) return;
+      scheduleSessionCheck();
     });
 
     sessionWatcher.on('error', () => {
@@ -404,20 +427,10 @@ function recordCursorActivity() {
   const isEnabled = config.watchedIntegrations.some(i => i.id === 'cursor' && i.enabled);
   if (!isEnabled) return;
   try {
-    if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-    let data = { sessions: {} };
-    if (fs.existsSync(SESSIONS_FILE)) {
-      try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch {}
-    }
-    if (!data.sessions) data.sessions = {};
-    const key = 'cursor:agent';
-    const nowIso = new Date().toISOString();
-    if (!data.sessions[key]) {
-      data.sessions[key] = { integration: 'cursor', session_id: 'agent', created_at: nowIso };
-    }
-    data.sessions[key].last_activity = nowIso;
-    data.last_updated = nowIso;
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    // Records `cursor:agent` with a fresh last_activity (atomic write).
+    store.updateSessions(data => store.applyHookEvent(data, {
+      integration: 'cursor', command: 'stay-awake', input: { session_id: 'agent' }
+    }));
     checkAgentSessions();
   } catch {}
 }
@@ -521,20 +534,10 @@ function recordCodexActivity() {
   const isEnabled = config.watchedIntegrations.some(i => i.id === 'codex-cli' && i.enabled);
   if (!isEnabled) return;
   try {
-    if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-    let data = { sessions: {} };
-    if (fs.existsSync(SESSIONS_FILE)) {
-      try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch {}
-    }
-    if (!data.sessions) data.sessions = {};
-    const key = 'codex-cli:app-server';
-    const nowIso = new Date().toISOString();
-    if (!data.sessions[key]) {
-      data.sessions[key] = { integration: 'codex-cli', session_id: 'app-server', created_at: nowIso };
-    }
-    data.sessions[key].last_activity = nowIso;
-    data.last_updated = nowIso;
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    // Records `codex-cli:app-server` with a fresh last_activity (atomic write).
+    store.updateSessions(data => store.applyHookEvent(data, {
+      integration: 'codex-cli', command: 'stay-awake', input: { session_id: 'app-server' }
+    }));
     checkAgentSessions();
   } catch {}
 }
@@ -617,15 +620,54 @@ function ensureHookLauncher() {
 // Any hook command Insomnia has ever written, across versions: the current .cmd
 // shim, the older bare-`node` form, and the pre-rename cc-caffeine builds.
 function isInsomniaHookCommand(command) {
-  if (!command) return false;
+  if (!command || typeof command !== 'string') return false;
   return command.includes('insomnia-hook.cmd')
     || command.includes('agent-hook.js')
     || command.includes('cc-caffeine');
 }
 
+// A Claude Code hook handler Insomnia wrote: shell form (command string) or
+// exec form (cmd.exe with the launcher among its args).
+function isInsomniaHookHandler(handler) {
+  if (!handler || typeof handler !== 'object') return false;
+  if (isInsomniaHookCommand(handler.command)) return true;
+  return Array.isArray(handler.args) && handler.args.some(isInsomniaHookCommand);
+}
+
 // ── Claude Code Hook Setup ─────────────────────────────────────────────────────
 function getClaudeSettingsPath() {
   return path.join(os.homedir(), '.claude', 'settings.json');
+}
+
+function getCmdExePath() {
+  const comspec = process.env.ComSpec || process.env.COMSPEC;
+  if (comspec && /cmd\.exe$/i.test(comspec)) return comspec;
+  return path.join(process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows', 'System32', 'cmd.exe');
+}
+
+// The hook handler Claude Code runs for one of our commands.
+//
+// Claude Code runs a hook *string* through Git Bash on Windows — or through
+// PowerShell when it cannot find Git Bash, which is common with the VS Code
+// extension. The old string, `"C:\…\insomnia-hook.cmd" stay-awake claude-code`,
+// is a parse error in PowerShell (a quoted string followed by bare words), so on
+// those machines every Insomnia hook failed and Claude Code was never detected.
+//
+// Exec form (`args`, Claude Code 2.1.139+) avoids shells altogether: Claude Code
+// starts cmd.exe directly with an argument list. `.cmd` files cannot be started
+// that way themselves, hence cmd.exe /c. cmd keeps the quotes libuv puts around a
+// launcher path with spaces only while the path holds none of & < > ( ) @ ^ |;
+// for the rare profile folder that does, keep the shell form, which Git Bash runs.
+function buildClaudeHookHandler(hookCommand) {
+  if (process.platform === 'win32' && !/[&<>()@^|%!"]/.test(HOOK_LAUNCHER)) {
+    return {
+      type: 'command',
+      command: getCmdExePath(),
+      args: ['/d', '/c', HOOK_LAUNCHER, hookCommand, 'claude-code'],
+      timeout: 30
+    };
+  }
+  return { type: 'command', command: `"${HOOK_LAUNCHER}" ${hookCommand} claude-code`, timeout: 30 };
 }
 
 function setupClaudeCodeHooks() {
@@ -636,22 +678,27 @@ function setupClaudeCodeHooks() {
     if (fs.existsSync(settingsPath)) {
       settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     }
-  } catch {}
+  } catch {
+    // Unreadable or hand-broken settings: leave the file alone rather than
+    // overwrite the user's other settings with just our hooks.
+    return;
+  }
 
-  if (!settings.hooks) settings.hooks = {};
+  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
 
   ensureHookLauncher();
 
-  const stayAwakeCmd = `"${HOOK_LAUNCHER}" stay-awake claude-code`;
-  const allowSleepCmd = `"${HOOK_LAUNCHER}" allow-sleep claude-code`;
+  const stayAwakeHook = { hooks: [buildClaudeHookHandler('stay-awake')] };
+  const allowSleepHook = { hooks: [buildClaudeHookHandler('allow-sleep')] };
 
-  const stayAwakeHook = { hooks: [{ type: 'command', command: stayAwakeCmd }] };
-  const allowSleepHook = { hooks: [{ type: 'command', command: allowSleepCmd }] };
-
-  const stayAwakeEvents = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest', 'Notification'];
-  // Stop fires when Claude finishes responding — the one unambiguous "work is
-  // done" signal. SessionEnd covers the session going away entirely.
-  const allowSleepEvents = ['Stop', 'SessionEnd'];
+  // Activity. The event name travels in the hook's JSON, so the hook script
+  // tells a new prompt from a tool starting or finishing (see session-store.js).
+  // Notification is deliberately absent: it also fires a minute *after* a turn
+  // ends ("waiting for your input") and used to re-arm the grace period then.
+  const stayAwakeEvents = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest'];
+  // End of a turn: Stop when Claude finishes, StopFailure when an API error ends
+  // it instead. SessionEnd covers the session going away entirely.
+  const allowSleepEvents = ['Stop', 'StopFailure', 'SessionEnd'];
 
   // Clear out hooks from every previous Insomnia build first — including events
   // we no longer manage (older versions wrote a `Stop` hook) and stale absolute
@@ -660,7 +707,7 @@ function setupClaudeCodeHooks() {
   for (const event of Object.keys(settings.hooks)) {
     if (!Array.isArray(settings.hooks[event])) continue;
     settings.hooks[event] = settings.hooks[event].filter(h =>
-      !h.hooks?.some(hh => isInsomniaHookCommand(hh.command))
+      !h.hooks?.some(isInsomniaHookHandler)
     );
     if (settings.hooks[event].length === 0) delete settings.hooks[event];
   }
@@ -675,6 +722,7 @@ function setupClaudeCodeHooks() {
     settings.hooks[event].push(allowSleepHook);
   }
 
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 }
 
@@ -686,8 +734,9 @@ function removeClaudeCodeHooks() {
     if (!settings.hooks) return;
 
     for (const event of Object.keys(settings.hooks)) {
+      if (!Array.isArray(settings.hooks[event])) continue;
       settings.hooks[event] = settings.hooks[event].filter(h =>
-        !h.hooks?.some(hh => isInsomniaHookCommand(hh.command))
+        !h.hooks?.some(isInsomniaHookHandler)
       );
       if (settings.hooks[event].length === 0) {
         delete settings.hooks[event];
@@ -805,15 +854,42 @@ function removeCodexHooks() {
   } catch {}
 }
 
+// ── Dev container bridge ───────────────────────────────────────────────────────
+// Claude Code inside a dev container runs its hooks in Linux, where neither the
+// launcher nor %USERPROFILE%\.insomnia exist. The container-side hook (see
+// devcontainer-features/) reports to this loopback endpoint instead, which
+// Docker Desktop exposes to containers as host.docker.internal.
+function getBridgePort() {
+  const port = Number(config.bridgePort);
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_BRIDGE_PORT;
+}
+
+function startHookBridge() {
+  if (!hookBridge) {
+    hookBridge = createHookBridge({
+      port: getBridgePort(),
+      isEnabled: id => config.watchedIntegrations.some(i => i.id === id && i.enabled),
+      onActivity: scheduleSessionCheck,
+      version: app.getVersion(),
+      log: msg => console.log(msg)
+    });
+  }
+  hookBridge.start();
+}
+
+function stopHookBridge() {
+  if (hookBridge) hookBridge.stop();
+}
+
 // ── Hook dispatch ──────────────────────────────────────────────────────────────
 function setupHooksForIntegration(integrationId) {
-  if (integrationId === 'claude-code') setupClaudeCodeHooks();
+  if (integrationId === 'claude-code') { setupClaudeCodeHooks(); startHookBridge(); }
   else if (integrationId === 'codex-cli') { setupCodexHooks(); watchCodexFiles(); }
   else if (integrationId === 'cursor') watchCursorFiles();
 }
 
 function removeHooksForIntegration(integrationId) {
-  if (integrationId === 'claude-code') removeClaudeCodeHooks();
+  if (integrationId === 'claude-code') { removeClaudeCodeHooks(); stopHookBridge(); }
   else if (integrationId === 'codex-cli') { removeCodexHooks(); stopCodexWatcher(); }
   else if (integrationId === 'cursor') stopCursorWatcher();
 }
@@ -1318,6 +1394,7 @@ app.on('before-quit', () => {
   if (sessionWatcher) { sessionWatcher.close(); sessionWatcher = null; }
   stopCodexWatcher();
   stopCursorWatcher();
+  stopHookBridge();
   releasePowerBlockers();
 });
 
@@ -1337,7 +1414,7 @@ app.whenReady().then(() => {
   // Clean up stale Codex false-positive entries left behind by older builds.
   try {
     if (fs.existsSync(SESSIONS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+      const data = store.readSessions(SESSIONS_FILE);
       let removed = false;
       for (const key of Object.keys(data.sessions || {})) {
         if (key.endsWith(':auto-detected')) { delete data.sessions[key]; removed = true; }
@@ -1346,7 +1423,7 @@ app.whenReady().then(() => {
         // cause a false awake window on first launch after upgrade.
         if (key === 'cursor:agent') { delete data.sessions[key]; removed = true; }
       }
-      if (removed) fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+      if (removed) store.writeSessions(data, SESSIONS_FILE);
     }
   } catch {}
 

@@ -1,0 +1,50 @@
+# Tests the "claude-code-stay-awake" Dev Container Feature and publishes it to
+# GitHub Container Registry as ghcr.io/<owner>/insomnia/claude-code-stay-awake.
+# After the first publish, make the package public in the repo's Packages
+# settings so dev containers can pull it without logging in.
+name: Dev Container Feature
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['devcontainer-features/**', '.github/workflows/devcontainer-feature.yml']
+  pull_request:
+    paths: ['devcontainer-features/**', '.github/workflows/devcontainer-feature.yml']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - mcr.microsoft.com/devcontainers/base:ubuntu
+          - mcr.microsoft.com/devcontainers/javascript-node:22
+          - node:22-bookworm-slim                     # no curl: the feature must install one
+          - mcr.microsoft.com/devcontainers/base:alpine  # musl + busybox userland
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install -g @devcontainers/cli
+      - run: devcontainer features test --skip-scenarios -f claude-code-stay-awake -i "${{ matrix.image }}" ./devcontainer-features
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: ns
+        # OCI names must be lower case; the repository is "Insomnia".
+        run: echo "namespace=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - uses: devcontainers/action@v1
+        with:
+          publish-features: "true"
+          base-path-to-features: "./devcontainer-features/src"
+          features-namespace: ${{ steps.ns.outputs.namespace }}
+          generate-docs: "false"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
