@@ -13,6 +13,8 @@ Lets [Insomnia](https://github.com/stanley-projects/Insomnia) on your Windows PC
 
 Rebuild the container. That's it — with the Claude Code integration switched on in Insomnia, the tray shows *"Staying awake for — Claude Code (dev container)"* while Claude works.
 
+**Using Insomnia's window?** Click the cog on the Claude Code trigger, then **Add project folder…**. It does the local setup below for you.
+
 **Not published yet, or using a fork?** Copy this folder into your project's `.devcontainer/` and reference it locally:
 
 ```jsonc

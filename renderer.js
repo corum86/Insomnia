@@ -14,6 +14,11 @@ const appGrid = document.getElementById('appGrid');
 const drawerLoading = document.getElementById('drawerLoading');
 const browseBtn = document.getElementById('browseBtn');
 const integrationList = document.getElementById('integrationList');
+const devcontainerOverlay = document.getElementById('devcontainerOverlay');
+const devcontainerClose = document.getElementById('devcontainerClose');
+const devcontainerList = document.getElementById('devcontainerList');
+const devcontainerMessage = document.getElementById('devcontainerMessage');
+const devcontainerAddBtn = document.getElementById('devcontainerAddBtn');
 
 let installedApps = [];
 
@@ -25,6 +30,16 @@ const INTEGRATION_ICONS = {
   'ollama': '\u{1F9E0}',
   'cursor': '\u270F'
 };
+
+// Integrations with a settings panel, opened from the cog on their trigger row
+const INTEGRATION_SETTINGS = {
+  'claude-code': () => openDevcontainerPanel()
+};
+
+const COG_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="3"/>
+  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+</svg>`;
 
 // ── UI Updates ─────────────────────────────────────────────────────────────────
 function updateUI(status) {
@@ -82,6 +97,7 @@ function renderTriggerList(status) {
         <div class="watch-item-name">${escapeHtml(int.name)}</div>
         <div class="watch-item-exe">Integration</div>
       </div>
+      ${INTEGRATION_SETTINGS[int.id] ? `<button class="btn-settings" title="Settings">${COG_SVG}</button>` : ''}
       <label class="switch" style="transform: scale(0.75);">
         <input type="checkbox" ${int.enabled ? 'checked' : ''}>
         <span class="slider"></span>
@@ -92,6 +108,9 @@ function renderTriggerList(status) {
     el.querySelector('input[type="checkbox"]').addEventListener('change', () => {
       window.insomnia.toggleIntegration(int.id);
     });
+    if (INTEGRATION_SETTINGS[int.id]) {
+      el.querySelector('.btn-settings').addEventListener('click', INTEGRATION_SETTINGS[int.id]);
+    }
     el.querySelector('.btn-remove').addEventListener('click', () => {
       window.insomnia.removeIntegration(int.id);
     });
@@ -271,6 +290,87 @@ browseBtn.addEventListener('click', async () => {
     closeDrawer();
   }
 });
+
+// ── Dev Containers (Claude Code settings) ─────────────────────────────────────
+const DEVCONTAINER_STATUS = {
+  ok: { badge: 'hook', text: 'Set up' },
+  published: { badge: 'added-badge', text: 'Published' }
+};
+
+async function openDevcontainerPanel() {
+  devcontainerMessage.innerHTML = '';
+  devcontainerOverlay.classList.add('open');
+  renderDevcontainerProjects(await window.insomnia.getDevcontainerProjects());
+}
+
+function closeDevcontainerPanel() {
+  devcontainerOverlay.classList.remove('open');
+}
+
+devcontainerClose.addEventListener('click', closeDevcontainerPanel);
+devcontainerOverlay.addEventListener('click', (e) => {
+  if (e.target === devcontainerOverlay) closeDevcontainerPanel();
+});
+
+devcontainerAddBtn.addEventListener('click', async () => {
+  devcontainerAddBtn.disabled = true;
+  try {
+    showDevcontainerResult(await window.insomnia.addDevcontainerProject());
+  } finally {
+    devcontainerAddBtn.disabled = false;
+  }
+});
+
+function showDevcontainerResult(result) {
+  renderDevcontainerProjects(result.projects);
+  devcontainerMessage.innerHTML = '';
+  if (result.message) devcontainerMessage.append(result.message);
+  for (const w of result.warnings || []) addMessageLine('warning', w);
+  if (result.error) addMessageLine('error', result.error);
+}
+
+function addMessageLine(className, text) {
+  const div = document.createElement('div');
+  div.className = className;
+  div.textContent = text;
+  devcontainerMessage.appendChild(div);
+}
+
+function renderDevcontainerProjects(projects) {
+  devcontainerList.innerHTML = '';
+  if (projects.length === 0) {
+    devcontainerList.innerHTML = '<div class="devcontainer-empty">No projects yet.</div>';
+    return;
+  }
+
+  projects.forEach(project => {
+    // Outdated (older Insomnia) or missing (removed by hand): offer to redo it.
+    const status = DEVCONTAINER_STATUS[project.status];
+    const el = document.createElement('div');
+    el.className = 'integration-item devcontainer-item';
+    el.innerHTML = `
+      <div class="integration-info">
+        <div class="integration-name">${escapeHtml(project.name)}</div>
+        <div class="integration-desc" title="${escapeHtml(project.configPath)}">${escapeHtml(project.detail)}</div>
+      </div>
+      ${status
+        ? `<span class="integration-badge ${status.badge}">${status.text}</span>`
+        : `<button class="btn-small">${project.status === 'outdated' ? 'Update' : 'Add again'}</button>`}
+      <button class="btn-remove" title="Remove">&times;</button>
+    `;
+
+    if (!status) {
+      el.querySelector('.btn-small').addEventListener('click', async () => {
+        showDevcontainerResult(await window.insomnia.updateDevcontainerProject(project.configPath));
+      });
+    }
+    el.querySelector('.btn-remove').addEventListener('click', async () => {
+      showDevcontainerResult(await window.insomnia.removeDevcontainerProject(project.configPath));
+    });
+
+    devcontainerList.appendChild(el);
+  });
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function escapeHtml(str) {

@@ -285,6 +285,22 @@ h1 {
   background: #ff3b3010;
 }
 
+.btn-settings {
+  background: none;
+  border: none;
+  color: #c7c7cc;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  display: flex;
+  transition: color 0.2s, background 0.2s;
+}
+
+.btn-settings:hover {
+  color: #1d1d1f;
+  background: #f2f2f7;
+}
+
 /* ── Footer ─────────────────────────────────────────────────────────────────── */
 
 footer {
@@ -662,6 +678,78 @@ footer {
 .integration-badge.added-badge {
   background: #f5f5f5;
   color: #aeaeb2;
+}
+
+/* ── Dev Containers ─────────────────────────────────────────────────────────── */
+
+.drawer-intro {
+  margin: 0 22px 14px;
+  font-size: 12px;
+  color: #8e8e93;
+  line-height: 1.45;
+}
+
+.drawer-intro code {
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  color: #1d1d1f;
+}
+
+.devcontainer-item {
+  cursor: default;
+}
+
+.devcontainer-item .integration-desc {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.integration-badge.outdated {
+  background: #fff4e5;
+  color: #b26a00;
+}
+
+.btn-small {
+  background: #1d1d1f;
+  color: #fff;
+  border: none;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+  flex-shrink: 0;
+}
+
+.btn-small:hover {
+  opacity: 0.8;
+}
+
+.drawer-message {
+  font-size: 12px;
+  line-height: 1.45;
+  padding-bottom: 6px;
+  color: #2e7d32;
+  user-select: text;
+}
+
+.drawer-message .warning {
+  color: #b26a00;
+  margin-top: 4px;
+}
+
+.drawer-message .error {
+  color: #c62828;
+  margin-top: 4px;
+}
+
+.devcontainer-empty {
+  text-align: center;
+  color: #aeaeb2;
+  font-size: 13px;
+  padding: 18px 0;
 }
 
 /* Trigger item type badge */

@@ -131,7 +131,9 @@ Inside a dev container Claude Code runs in Linux, so its hooks can't reach the W
 1. **Insomnia listens on `127.0.0.1:47391`** while the Claude Code integration is on. Docker Desktop makes this reachable from containers as `host.docker.internal`. It only accepts JSON from programs (requests from web pages are refused) and is never exposed to your network.
 2. **The `claude-code-stay-awake` Dev Container Feature** installs a small hook in the container. It forwards Claude Code's hook events to Insomnia and, while a turn is open, sends a heartbeat every minute so a long build inside the container keeps the PC awake — and a container that has stopped lets it sleep.
 
-Add the feature to your `.devcontainer/devcontainer.json`:
+**Easiest:** click the cog on the Claude Code trigger, then **Add project folder…** and pick your project. Insomnia copies the feature into `.devcontainer/claude-code-stay-awake/` and adds `"./claude-code-stay-awake": {}` to `devcontainer.json`. It leaves your comments and formatting alone, and if `.devcontainer/` holds several configurations it adds the feature to each one. Rebuild the container afterwards. The panel lists the projects you've set up: after an Insomnia update, a project whose copy is out of date shows **Update**, and **×** removes the feature from the project again.
+
+Or add the feature to your `.devcontainer/devcontainer.json` by hand:
 
 ```jsonc
 "features": {

@@ -105,6 +105,28 @@
     </div>
   </div>
 
+  <!-- Claude Code: dev container setup -->
+  <div class="modal-overlay" id="devcontainerOverlay">
+    <div class="drawer">
+      <div class="drawer-header">
+        <h2>Dev containers</h2>
+        <button class="btn-close" id="devcontainerClose">&times;</button>
+      </div>
+      <p class="drawer-intro">
+        Lets Insomnia see Claude Code working inside a project's dev container.
+        Adds a <code>claude-code-stay-awake</code> folder and one line to its
+        <code>devcontainer.json</code>.
+      </p>
+      <div class="drawer-scroll">
+        <div class="integration-list" id="devcontainerList"></div>
+        <div class="drawer-message" id="devcontainerMessage"></div>
+      </div>
+      <div class="drawer-footer">
+        <button class="btn-browse" id="devcontainerAddBtn">Add project folder...</button>
+      </div>
+    </div>
+  </div>
+
   <script src="renderer.js"></script>
 </body>
 </html>

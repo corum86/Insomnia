@@ -5,6 +5,7 @@ const os = require('os');
 const { execFile, spawn } = require('child_process');
 const store = require('./session-store');
 const { createHookBridge, DEFAULT_BRIDGE_PORT } = require('./hook-bridge');
+const devcontainerSetup = require('./devcontainer-setup');
 
 // ── State ──────────────────────────────────────────────────────────────────────
 let mainWindow = null;
@@ -153,6 +154,8 @@ function loadConfig() {
   if (!config.watchedApps) config.watchedApps = [];
   if (!config.watchedIntegrations) config.watchedIntegrations = [];
   if (!config.seenIntegrations) config.seenIntegrations = [];
+  // devcontainer.json files the dev container feature was added to from the app.
+  if (!config.devcontainerProjects) config.devcontainerProjects = [];
   if (config.launchOnStartup === undefined) config.launchOnStartup = true;
   manualAwake = config.manualAwake || false;
 }
@@ -881,6 +884,109 @@ function stopHookBridge() {
   if (hookBridge) hookBridge.stop();
 }
 
+// ── Dev container projects ─────────────────────────────────────────────────────
+// Adds the claude-code-stay-awake feature to a project's devcontainer.json (see
+// devcontainer-setup.js), so the bridge above hears from its container.
+function getDevcontainerProjects() {
+  return config.devcontainerProjects.map(p => {
+    const configPath = p.configPath;
+    const devDir = path.dirname(configPath);
+    const inNamedConfig = path.basename(devDir).toLowerCase() !== '.devcontainer';
+    const projectDir = inNamedConfig ? path.dirname(path.dirname(devDir)) : path.dirname(devDir);
+    return {
+      configPath,
+      name: path.basename(projectDir) + (inNamedConfig ? ` (${path.basename(devDir)})` : ''),
+      detail: path.relative(projectDir, configPath),
+      status: devcontainerSetup.getFeatureStatus(configPath)
+    };
+  });
+}
+
+function rememberDevcontainerProject(configPath) {
+  const key = configPath.toLowerCase();
+  if (!config.devcontainerProjects.some(p => p.configPath.toLowerCase() === key)) {
+    config.devcontainerProjects.push({ configPath });
+  }
+}
+
+function findDevcontainerProject(configPath) {
+  return config.devcontainerProjects.find(p => p.configPath === configPath);
+}
+
+async function addDevcontainerProject() {
+  const pick = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose a project that has a dev container',
+    properties: ['openDirectory']
+  });
+  if (pick.canceled || pick.filePaths.length === 0) return { projects: getDevcontainerProjects() };
+
+  const { configs, rootLevel } = devcontainerSetup.findDevcontainerConfigs(pick.filePaths[0]);
+  if (configs.length === 0) {
+    const error = rootLevel
+      ? 'This project keeps its config in .devcontainer.json at the top level. Move it to .devcontainer/devcontainer.json and try again: a local feature has to live in the .devcontainer folder.'
+      : 'No .devcontainer/devcontainer.json in that folder. Choose the project folder (or its .devcontainer folder).';
+    return { projects: getDevcontainerProjects(), error };
+  }
+
+  let added = 0;
+  const warnings = [];
+  const errors = [];
+  for (const configPath of configs) {
+    try {
+      const r = devcontainerSetup.installFeature(configPath, { bridgePort: getBridgePort() });
+      rememberDevcontainerProject(configPath);
+      if (r.publishedKey) warnings.push(`${path.relative(pick.filePaths[0], configPath) || 'devcontainer.json'} already uses ${r.publishedKey}; left as it is.`);
+      else added++;
+      warnings.push(...r.warnings);
+    } catch (err) {
+      errors.push(err.message);
+    }
+  }
+  saveConfig();
+  const where = configs.length > 1 ? ` to ${added} of ${configs.length} configurations` : '';
+  return {
+    projects: getDevcontainerProjects(),
+    message: added ? `Added${where}. Rebuild the container to apply it.` : undefined,
+    warnings,
+    error: errors.join(' ') || undefined
+  };
+}
+
+function updateDevcontainerProject(configPath) {
+  if (!findDevcontainerProject(configPath)) return { projects: getDevcontainerProjects() };
+  try {
+    const r = devcontainerSetup.installFeature(configPath, { bridgePort: getBridgePort() });
+    return { projects: getDevcontainerProjects(), message: 'Updated. Rebuild the container to apply it.', warnings: r.warnings };
+  } catch (err) {
+    return { projects: getDevcontainerProjects(), error: err.message };
+  }
+}
+
+async function removeDevcontainerProject(configPath) {
+  const entry = findDevcontainerProject(configPath);
+  if (!entry) return { projects: getDevcontainerProjects() };
+
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: 'question',
+    buttons: ['Remove from project', 'Only forget it', 'Cancel'],
+    defaultId: 0,
+    cancelId: 2,
+    title: 'Remove dev container feature',
+    message: `Remove Insomnia from ${configPath}?`,
+    detail: `"Remove from project" deletes the ${devcontainerSetup.FEATURE_ID} folder and its entry in devcontainer.json. "Only forget it" leaves the project as it is.`
+  });
+  if (response === 2) return { projects: getDevcontainerProjects() };
+
+  let message;
+  if (response === 0) {
+    const r = devcontainerSetup.uninstallFeature(configPath);
+    message = r.configChanged || r.filesRemoved ? 'Removed. Rebuild the container to apply it.' : undefined;
+  }
+  config.devcontainerProjects = config.devcontainerProjects.filter(p => p !== entry);
+  saveConfig();
+  return { projects: getDevcontainerProjects(), message };
+}
+
 // ── Hook dispatch ──────────────────────────────────────────────────────────────
 function setupHooksForIntegration(integrationId) {
   if (integrationId === 'claude-code') { setupClaudeCodeHooks(); startHookBridge(); }
@@ -1319,6 +1425,12 @@ function setupIPC() {
     }
     return getStatus();
   });
+
+  // Dev container projects
+  ipcMain.handle('get-devcontainer-projects', () => getDevcontainerProjects());
+  ipcMain.handle('add-devcontainer-project', () => addDevcontainerProject());
+  ipcMain.handle('update-devcontainer-project', (_, configPath) => updateDevcontainerProject(configPath));
+  ipcMain.handle('remove-devcontainer-project', (_, configPath) => removeDevcontainerProject(configPath));
 
   // App discovery
   ipcMain.handle('get-installed-apps', async () => {

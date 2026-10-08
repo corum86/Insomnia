@@ -21,6 +21,12 @@ contextBridge.exposeInMainWorld('insomnia', {
   removeIntegration: (id) => ipcRenderer.invoke('remove-integration', id),
   toggleIntegration: (id) => ipcRenderer.invoke('toggle-integration', id),
 
+  // Dev container projects (Claude Code)
+  getDevcontainerProjects: () => ipcRenderer.invoke('get-devcontainer-projects'),
+  addDevcontainerProject: () => ipcRenderer.invoke('add-devcontainer-project'),
+  updateDevcontainerProject: (configPath) => ipcRenderer.invoke('update-devcontainer-project', configPath),
+  removeDevcontainerProject: (configPath) => ipcRenderer.invoke('remove-devcontainer-project', configPath),
+
   // Startup
   getStartup: () => ipcRenderer.invoke('get-startup'),
   toggleStartup: () => ipcRenderer.invoke('toggle-startup')

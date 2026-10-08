@@ -29,6 +29,8 @@
       "agent-hook.js",
       "hook-bridge.js",
       "session-store.js",
+      "devcontainer-setup.js",
+      "devcontainer-features/src/claude-code-stay-awake/**",
       "assets/tray-active.png",
       "assets/tray-inactive.png",
       "assets/icon.png",

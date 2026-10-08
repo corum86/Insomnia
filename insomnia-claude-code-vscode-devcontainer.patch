@@ -1,0 +1,2269 @@
+From 61c490348fc3287030db5ed713bf517d60c7848f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 20:50:22 +0200
+Subject: [PATCH] feat: keep Windows awake for Claude Code in VS Code and dev
+ containers
+
+VS Code: Insomnia's hook was a plain command line, which Claude Code runs
+through PowerShell when Git Bash isn't installed (common with the VS Code
+extension) - a parse error there, so no hook ever ran. Hooks are now written
+in exec form (cmd.exe /d /c <launcher>, Claude Code 2.1.139+), independent of
+the shell.
+
+The Stop hook has been reported missing in the VS Code extension, so sessions
+no longer depend on it: hooks act on the event name, open tool calls are
+tracked by tool_use_id (a running build stays awake up to 30 min while
+claude.exe lives), and an open turn alone is trusted only after the session
+has fired Stop once. Notification no longer re-arms the grace after a turn.
+
+Dev containers: Insomnia runs a loopback bridge (127.0.0.1:47391, reached as
+host.docker.internal). The new claude-code-stay-awake Dev Container Feature
+installs a POSIX hook via Claude Code's managed-settings drop-in that posts
+each event and sends a heartbeat while a turn is open, standing in for the
+process check Windows can't do inside a container.
+
+Shared session rules live in session-store.js (atomic writes for every
+writer); npm test covers the decision table, the bridge and the container
+hook. Verified on Linux with a real Claude Code 2.1.293 binary against a mock
+API; not yet run on Windows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XBAszwHsQVyE6me7pkAKDH
+---
+ .github/workflows/devcontainer-feature.yml    |  50 +++
+ CLAUDE.md                                     |  11 +-
+ README.md                                     |  41 ++-
+ agent-hook.js                                 |  87 ++---
+ .../src/claude-code-stay-awake/README.md      |  70 ++++
+ .../src/claude-code-stay-awake/claude-hook.sh | 186 +++++++++++
+ .../devcontainer-feature.json                 |  26 ++
+ .../insomnia-hooks.json                       |  92 ++++++
+ .../src/claude-code-stay-awake/install.sh     |  67 ++++
+ .../test/claude-code-stay-awake/test.sh       |  25 ++
+ docs/llms-full.txt                            |   2 +-
+ hook-bridge.js                                | 226 +++++++++++++
+ main.js                                       | 249 +++++++++-----
+ package.json                                  |   9 +-
+ session-store.js                              | 306 ++++++++++++++++++
+ test/hook-bridge.test.js                      | 218 +++++++++++++
+ test/session-store.test.js                    | 169 ++++++++++
+ 17 files changed, 1684 insertions(+), 150 deletions(-)
+ create mode 100644 .github/workflows/devcontainer-feature.yml
+ create mode 100644 devcontainer-features/src/claude-code-stay-awake/README.md
+ create mode 100755 devcontainer-features/src/claude-code-stay-awake/claude-hook.sh
+ create mode 100644 devcontainer-features/src/claude-code-stay-awake/devcontainer-feature.json
+ create mode 100644 devcontainer-features/src/claude-code-stay-awake/insomnia-hooks.json
+ create mode 100755 devcontainer-features/src/claude-code-stay-awake/install.sh
+ create mode 100755 devcontainer-features/test/claude-code-stay-awake/test.sh
+ create mode 100644 hook-bridge.js
+ create mode 100644 session-store.js
+ create mode 100644 test/hook-bridge.test.js
+ create mode 100644 test/session-store.test.js
+
+diff --git a/.github/workflows/devcontainer-feature.yml b/.github/workflows/devcontainer-feature.yml
+new file mode 100644
+index 0000000..6b1b54a
+--- /dev/null
++++ b/.github/workflows/devcontainer-feature.yml
+@@ -0,0 +1,50 @@
++# Tests the "claude-code-stay-awake" Dev Container Feature and publishes it to
++# GitHub Container Registry as ghcr.io/<owner>/insomnia/claude-code-stay-awake.
++# After the first publish, make the package public in the repo's Packages
++# settings so dev containers can pull it without logging in.
++name: Dev Container Feature
++
++on:
++  workflow_dispatch:
++  push:
++    branches: [master]
++    paths: ['devcontainer-features/**', '.github/workflows/devcontainer-feature.yml']
++  pull_request:
++    paths: ['devcontainer-features/**', '.github/workflows/devcontainer-feature.yml']
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        image:
++          - mcr.microsoft.com/devcontainers/base:ubuntu
++          - mcr.microsoft.com/devcontainers/javascript-node:22
++          - node:22-bookworm-slim                     # no curl: the feature must install one
++          - mcr.microsoft.com/devcontainers/base:alpine  # musl + busybox userland
++    steps:
++      - uses: actions/checkout@v4
++      - run: npm install -g @devcontainers/cli
++      - run: devcontainer features test --skip-scenarios -f claude-code-stay-awake -i "${{ matrix.image }}" ./devcontainer-features
++
++  publish:
++    needs: test
++    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      packages: write
++    steps:
++      - uses: actions/checkout@v4
++      - id: ns
++        # OCI names must be lower case; the repository is "Insomnia".
++        run: echo "namespace=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
++      - uses: devcontainers/action@v1
++        with:
++          publish-features: "true"
++          base-path-to-features: "./devcontainer-features/src"
++          features-namespace: ${{ steps.ns.outputs.namespace }}
++          generate-docs: "false"
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 5fa2d0d..b2fab5d 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -38,6 +38,15 @@ Suggested note format:
+ 
+ ## Agent Log
+ 
++### 2026-10-07
++- [Claude] Claude Code in the VS Code extension and in dev containers. Not built or run on Windows yet; everything below was verified on Linux (unit tests, a real Claude Code 2.1.293 binary against a mock API, and main.js booted with a stubbed Electron). Needs a Windows check before release: hooks firing from the VS Code extension, and a dev container reaching the bridge.
++- [Claude] Hook command was shell-dependent. Claude Code runs a hook string through Git Bash, or PowerShell when Git Bash isn't installed (common with the VS Code extension). `"C:\...\insomnia-hook.cmd" stay-awake claude-code` is a PowerShell parse error, so no Insomnia hook ran on those machines. Hooks are now exec form: `command: <ComSpec cmd.exe>`, `args: ['/d','/c',<launcher>,<cmd>,'claude-code']` (Claude Code 2.1.139+). Falls back to the old string only if the launcher path holds cmd metacharacters (`&<>()@^|%!`), where cmd's quote rule would break it. `isInsomniaHookHandler()` recognises both forms for the sweep/removal.
++- [Claude] `Stop` has been reported not firing in the VS Code extension (anthropics/claude-code#40029, #49851; we saw the same in April). The old rule (open turn + claude.exe alive = 30 min) would then hold the PC awake 30 min after every turn. New per-session state in `session-store.js`: hooks now act on `hook_event_name` from stdin. PreToolUse/PostToolUse(+Failure) track open tool calls by `tool_use_id`; a running tool keeps the PC awake up to 30 min while claude.exe lives (the long-build case, without needing Stop). An open turn alone is trusted only once that session has fired `Stop` at least once (`stop_seen`). Stop/StopFailure close the turn (record kept a day so `stop_seen` survives), SessionEnd deletes it, UserPromptSubmit clears tools left open by an interrupted turn.
++- [Claude] Notification removed from the wired events and treated as touch-only: it fires ~60s *after* a turn ends ("waiting for your input"), and in v1.5.0 that recreated the session and re-armed the 30-min grace after every turn. Added PostToolUseFailure and StopFailure.
++- [Claude] Dev containers: new `hook-bridge.js` (loopback HTTP on 127.0.0.1:47391, `config.bridgePort` to change) runs while the Claude Code integration is enabled. Refuses requests with an Origin header, Host names outside a docker/podman/localhost allowlist (DNS rebinding), and non-JSON bodies. Bridged sessions are stored with `origin` (never `local`) and judged by heartbeat (`REMOTE_HEARTBEAT_TTL_MS` 150s) instead of tasklist. Container side is a Dev Container Feature in `devcontainer-features/src/claude-code-stay-awake`: POSIX `claude-hook.sh` posts each event, runs a detached heartbeat every 60s while a turn is open (stops on Stop/SessionEnd, claude exit, or 6h), registered via `/etc/claude-code/managed-settings.d/50-insomnia.json` so a mounted `~/.claude` volume doesn't hide it. `.github/workflows/devcontainer-feature.yml` tests it on 4 images and publishes to `ghcr.io/<owner>/insomnia/claude-code-stay-awake`; package must be made public after the first publish.
++- [Claude] Sessions file now written atomically (temp + rename) through `session-store.js` by every writer, including the Codex/Cursor watchers; main.js watches the `.insomnia` folder instead of the file, and session checks fired by a hook reuse the last tasklist instead of assuming no process (that dropped the long-tool grace briefly on every hook). `setupClaudeCodeHooks()` no longer overwrites a settings.json it can't parse. `session-store.js` is in `asarUnpack` because agent-hook.js requires it from the unpacked folder.
++- [Claude] Tests: `npm test` (node:test) — 20 decision-table cases plus 8 bridge/container-hook cases (Linux-only ones skip elsewhere).
++
+ ### 2026-09-07
+ - [Claude] Installed Insomnia on the new PC (user profile `nzube`). Two things made it a no-op there: this machine has no Node on PATH, so every hook Insomnia writes (`node "...agent-hook.js"`) failed silently, and the carried-over `~/.claude/settings.json` still had a `Stop` hook pointing at the old `C:\Users\HP\...` install path. App looked installed and did nothing.
+ - [Claude] v1.5.0: hooks no longer depend on a Node install. `ensureHookLauncher()` writes `~/.insomnia/insomnia-hook.cmd`, a batch/shell polyglot that re-execs the app's own Electron binary with `ELECTRON_RUN_AS_NODE=1`. Claude Code hooks and the Codex `notify` line (now `['cmd','/c',<launcher>,...]` using TOML literal strings so Windows backslashes survive) both point at it. Polyglot because we do not control which shell the host tool spawns hooks with — verified working from both cmd.exe and Git Bash with no Node installed. Regenerated on every launch so upgrades and reinstalls keep the path fresh.
+@@ -92,7 +101,7 @@ Suggested note format:
+ - **Version**: v1.5.0 built locally (`dist/Insomnia Setup 1.5.0.exe`, SHA256 2C3C7BD726880604A4471BB16449C43435932560AFDF2E00AD56C8284C5F643B), not yet released. v1.4.3 released. GitHub release `v1.4.3` live with installer `Insomnia.Setup.1.4.3.exe`. SHA256: 394D25A0BE3DBA6CECA610C8AA3538B32A35D57BAA6F91FBEBB0CB26E25096E8.
+ - **Hook runtime**: since v1.5.0 no hook depends on a Node install. All hooks call `~/.insomnia/insomnia-hook.cmd`, a batch/shell polyglot regenerated on every launch that runs the app's bundled Electron with `ELECTRON_RUN_AS_NODE=1`.
+ - **Out of the box**: a fresh install (no config.json) auto-enables every integration whose tool directory is present, so a clean install needs zero clicks.
+-- **Detection**: Claude Code = hook-based (`~/.claude/settings.json`). Codex = hook-based dual-path: `notify` in `~/.codex/config.toml` for CLI + session transcript watcher/poller for VS Code and standalone app-server surfaces. Cursor = hook-based: polls `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` every 5s for active Agent session activity. Aider/Ollama = process-based with 30s grace.
++- **Detection**: Claude Code = hook-based (`~/.claude/settings.json`, exec form via cmd.exe), turn/tool-call aware (`session-store.js`), terminal + VS Code extension; dev containers via the `claude-code-stay-awake` feature → loopback bridge on 47391 with heartbeats (unreleased, needs Windows verification). Codex = hook-based dual-path: `notify` in `~/.codex/config.toml` for CLI + session transcript watcher/poller for VS Code and standalone app-server surfaces. Cursor = hook-based: polls `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` every 5s for active Agent session activity. Aider/Ollama = process-based with 30s grace.
+ - **Known limitation**: If user's very first Codex CLI prompt takes >3 min before any `notify` fires, PC may sleep mid-generation. Subsequent turns are covered by 5-min process grace. Acceptable trade-off.
+ - **Distribution**: GitHub Release v1.4.3 live. Scoop updated (stanley-projects/scoop-stanley). winget PR pending: microsoft/winget-pkgs#381028. v1.4.2 winget PR #372315 still pending merge.
+ - **Remaining tasks**: Update Dev.to + Hashnode posts (Cursor hook-based + startup feature). Reddit update comments. HN Show HN. AlternativeTo/Product Hunt/awesome-windows.
+diff --git a/README.md b/README.md
+index 84b6de0..34af65f 100644
+--- a/README.md
++++ b/README.md
+@@ -30,7 +30,7 @@ Insomnia has built-in support for AI coding tools with two types of monitoring:
+ 
+ | Integration | Type | How It Works |
+ |---|---|---|
+-| **Claude Code** | Hook-based | Knows when Claude is *actively working* (not just open). Wakes on tool use, sleeps when idle. |
++| **Claude Code** | Hook-based | Knows when Claude is *actively working* (not just open) — in the terminal, the VS Code extension, or a dev container. Stays awake through long builds, sleeps when the turn ends. |
+ | **Cursor** | Hook-based | Knows when Cursor Agent is *actively working*. Polls agent transcripts; idle = asleep. |
+ | **Aider** | Process-based | Keeps awake while `aider.exe` is running |
+ | **OpenAI Codex** | Hook-based | Knows when Codex is *actively working* (CLI, VS Code, or desktop). Uses Codex's `notify` config plus Codex session activity to track active work. |
+@@ -102,19 +102,47 @@ Insomnia uses Electron's `powerSaveBlocker` API to prevent Windows from entering
+ 
+ 1. **Manual toggle** — User explicitly wants the PC awake
+ 2. **Process monitoring** — Polls `tasklist` every 10 seconds to check if watched apps are running
+-3. **Hook-based sessions** — For tools like Claude Code, lightweight hooks signal activity to a shared session file (`~/.insomnia/agent-sessions.json`). A Claude Code session ends when its `Stop` hook fires; otherwise it expires after 3 minutes of silence, or up to 30 minutes while `claude.exe` is still alive and a turn is still open.
++3. **Hook-based sessions** — For tools like Claude Code, lightweight hooks signal activity to a shared session file (`~/.insomnia/agent-sessions.json`). A Claude Code session is released the moment its turn ends (`Stop`); otherwise after 3 minutes of silence, or — up to 30 minutes — while a tool call is still running and Claude is still alive.
+ 
+ If *any* trigger is active, the PC stays awake. When *all* triggers go inactive, normal sleep behavior resumes.
+ 
+ ### Claude Code Integration Details
+ 
+-When you enable the Claude Code integration, Insomnia adds hooks to `~/.claude/settings.json` that fire on:
++Works in the terminal, in the **VS Code extension**, and inside a **dev container** (see below). When you enable the Claude Code integration, Insomnia adds hooks to `~/.claude/settings.json` that fire on:
+ 
+-- `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification` → signal activity (stay awake)
+-- `SessionEnd` → signal idle (allow sleep)
++- `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest` → activity (stay awake)
++- `Stop`, `StopFailure` → the turn is over (allow sleep); `SessionEnd` → the session is gone
++
++Each hook says which event fired, so Insomnia follows the turn rather than guessing from silence:
++
++- **Any hook in the last 3 minutes** keeps the PC awake.
++- **A tool call still running** (a `PreToolUse` with no `PostToolUse` yet — a 10-minute build, a long test run) keeps it awake for up to 30 minutes, as long as Claude itself is still running. No hook fires while a tool runs, so this is what protects long builds.
++- **A long reply with no tool calls** is covered the same way once the session has shown it reports the end of its turns with `Stop`.
++- **`Stop` releases immediately.** If a host never sends `Stop` (it has been reported missing in the VS Code extension), the session simply lets go 3 minutes after Claude's last action instead of hanging on.
++
++The hooks are written in Claude Code's exec form (`command` + `args`, which needs Claude Code 2.1.139 or newer), so they run the same whether Claude Code would have used Git Bash or PowerShell. Earlier builds wrote a plain command line, which PowerShell — Claude Code's fallback when Git Bash isn't installed, common with the VS Code extension — could not parse, so no Insomnia hook ever ran there.
+ 
+ This means your PC stays awake precisely while Claude is doing work — reading files, running commands, writing code — and goes back to normal the moment it stops. No wasted power, no interrupted sessions.
+ 
++### Claude Code in a Dev Container
++
++Inside a dev container Claude Code runs in Linux, so its hooks can't reach the Windows hook or `%USERPROFILE%\.insomnia`, and Windows can't see the `claude` process. Two pieces close that gap:
++
++1. **Insomnia listens on `127.0.0.1:47391`** while the Claude Code integration is on. Docker Desktop makes this reachable from containers as `host.docker.internal`. It only accepts JSON from programs (requests from web pages are refused) and is never exposed to your network.
++2. **The `claude-code-stay-awake` Dev Container Feature** installs a small hook in the container. It forwards Claude Code's hook events to Insomnia and, while a turn is open, sends a heartbeat every minute so a long build inside the container keeps the PC awake — and a container that has stopped lets it sleep.
++
++Add the feature to your `.devcontainer/devcontainer.json`:
++
++```jsonc
++"features": {
++  "ghcr.io/stanley-projects/insomnia/claude-code-stay-awake:1": {}
++}
++```
++
++Or, before it's published, copy [`devcontainer-features/src/claude-code-stay-awake`](devcontainer-features/src/claude-code-stay-awake) into your `.devcontainer/` folder and use `"./claude-code-stay-awake": {}`. To get it in every dev container without editing each repo, add it to VS Code's `dev.containers.defaultFeatures` setting. See the [feature's README](devcontainer-features/src/claude-code-stay-awake/README.md) for options, firewalled containers, and troubleshooting.
++
++The tray then shows *"Staying awake for — Claude Code (dev container)"*.
++
+ ### Cursor Integration Details
+ 
+ When you enable the Cursor integration, Insomnia polls `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` every 5 seconds. Cursor writes these transcript files during active Agent sessions — they only change when the Agent is actively working, not while Cursor is sitting idle. When Insomnia detects a change, it signals activity and keeps Windows awake. The sleep lock is released within 3 minutes of the last transcript change.
+@@ -130,6 +158,7 @@ Settings are stored in your Electron user data directory and persist across rest
+ - **Watched apps** — list of executables to monitor, each with an enable/disable toggle
+ - **Watched integrations** — AI tools with their monitoring type and enabled state
+ - **Manual awake state** — remembered across restarts
++- **`bridgePort`** (optional, edit `%APPDATA%\insomnia-app\config.json`) — port for the dev container bridge, default `47391`. If you change it, set the feature's `bridgePort` option to match.
+ 
+ ## Screenshots
+ 
+@@ -171,7 +200,7 @@ Setting your screen timeout to "Never" or 2+ hours works, but then your PC never
+ Install Insomnia and add a trigger — an AI integration, a watched app, or the manual toggle. Insomnia uses Electron's `powerSaveBlocker` API to suppress the Windows sleep timer precisely while a trigger is active.
+ 
+ **Does Insomnia work with Claude Code?**  
+-Yes. Enable the Claude Code integration and Insomnia hooks into `~/.claude/settings.json`. Your PC wakes when Claude starts working and sleeps within 3 minutes after it goes idle.
++Yes — in the terminal, in the VS Code extension, and inside a dev container. Enable the Claude Code integration and Insomnia hooks into `~/.claude/settings.json`; for dev containers also add the `claude-code-stay-awake` Dev Container Feature. Your PC stays awake while Claude works (including long builds) and is released when the turn ends.
+ 
+ **Does Insomnia work with Cursor?**  
+ Yes. Insomnia polls `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` every 5 seconds. These files are only written during active Cursor Agent sessions, so the PC stays awake only while the Agent is working — not just because Cursor is open.
+diff --git a/agent-hook.js b/agent-hook.js
+index 8c3add9..a8d471a 100644
+--- a/agent-hook.js
++++ b/agent-hook.js
+@@ -3,77 +3,58 @@
+ /**
+  * Lightweight hook handler for Insomnia integrations.
+  * Called by Claude Code hooks (and similar tools) to signal activity.
+- * No Electron dependency — just reads stdin and writes to a JSON file.
++ * No Electron dependency — reads the hook's JSON from stdin and records it in
++ * ~/.insomnia/agent-sessions.json (see session-store.js for the rules).
+  *
+  * Usage:
+- *   echo '{"session_id":"abc"}' | node agent-hook.js stay-awake <integration-id>
+- *   echo '{"session_id":"abc"}' | node agent-hook.js allow-sleep <integration-id>
++ *   echo '{"session_id":"abc","hook_event_name":"PreToolUse","tool_use_id":"t1"}' | node agent-hook.js stay-awake <integration-id>
++ *   echo '{"session_id":"abc","hook_event_name":"Stop"}' | node agent-hook.js allow-sleep <integration-id>
++ *
++ * Claude Code passes the event name in the JSON, so the event decides what
++ * happens; the command is only a fallback for tools that do not send one.
++ *
++ * A hook must never get in the agent's way: no stdout, always exit 0.
+  */
+ 
+-const fs = require('fs');
+-const path = require('path');
+-const os = require('os');
+-
+-const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
+-const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
++const store = require('./session-store');
+ 
+ const command = process.argv[2];
+ const integrationId = process.argv[3] || 'unknown';
+ 
+-function readSessions() {
+-  try {
+-    if (fs.existsSync(SESSIONS_FILE)) {
+-      return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+-    }
+-  } catch {}
+-  return { sessions: {} };
+-}
+-
+-function writeSessions(data) {
+-  if (!fs.existsSync(SESSIONS_DIR)) {
+-    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+-  }
+-  data.last_updated = new Date().toISOString();
+-  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+-}
+-
+ function readStdin() {
+   return new Promise((resolve) => {
+     let data = '';
+-    process.stdin.setEncoding('utf8');
+-    process.stdin.on('data', chunk => { data += chunk; });
+-    process.stdin.on('end', () => {
++    let done = false;
++    const finish = () => {
++      if (done) return;
++      done = true;
+       try { resolve(JSON.parse(data)); }
+       catch { resolve({}); }
+-    });
+-    // Timeout after 1 second if no stdin
+-    setTimeout(() => resolve({}), 1000);
++    };
++    try {
++      process.stdin.setEncoding('utf8');
++      process.stdin.on('data', chunk => { data += chunk; });
++      process.stdin.on('end', finish);
++      process.stdin.on('error', finish);
++    } catch {
++      finish();
++    }
++    // Some callers (Codex notify) never close stdin — don't wait forever.
++    setTimeout(finish, 1000);
+   });
+ }
+ 
+ async function main() {
+   const input = await readStdin();
+-  const sessionId = input.session_id || 'default';
+-  const key = `${integrationId}:${sessionId}`;
+-
+-  const sessions = readSessions();
+-
+-  if (command === 'stay-awake') {
+-    if (!sessions.sessions[key]) {
+-      sessions.sessions[key] = {
+-        integration: integrationId,
+-        session_id: sessionId,
+-        created_at: new Date().toISOString()
+-      };
+-    }
+-    sessions.sessions[key].last_activity = new Date().toISOString();
+-    writeSessions(sessions);
+-  } else if (command === 'allow-sleep') {
+-    delete sessions.sessions[key];
+-    writeSessions(sessions);
+-  }
+-
++  try {
++    store.updateSessions(data => store.applyHookEvent(data, {
++      integration: integrationId,
++      command,
++      input,
++      origin: 'local'
++    }));
++  } catch {}
+   process.exit(0);
+ }
+ 
+-main();
++main().catch(() => process.exit(0));
+diff --git a/devcontainer-features/src/claude-code-stay-awake/README.md b/devcontainer-features/src/claude-code-stay-awake/README.md
+new file mode 100644
+index 0000000..7b98757
+--- /dev/null
++++ b/devcontainer-features/src/claude-code-stay-awake/README.md
+@@ -0,0 +1,70 @@
++# Insomnia: keep the host awake for Claude Code (`claude-code-stay-awake`)
++
++Lets [Insomnia](https://github.com/stanley-projects/Insomnia) on your Windows PC see Claude Code working **inside a dev container**, so the PC doesn't go to sleep — and pause your container — in the middle of a task.
++
++## Usage
++
++```jsonc
++// .devcontainer/devcontainer.json
++"features": {
++  "ghcr.io/stanley-projects/insomnia/claude-code-stay-awake:1": {}
++}
++```
++
++Rebuild the container. That's it — with the Claude Code integration switched on in Insomnia, the tray shows *"Staying awake for — Claude Code (dev container)"* while Claude works.
++
++**Not published yet, or using a fork?** Copy this folder into your project's `.devcontainer/` and reference it locally:
++
++```jsonc
++"features": { "./claude-code-stay-awake": {} }
++```
++
++**Want it in every dev container?** Add it once to your VS Code user settings instead of each repo:
++
++```jsonc
++"dev.containers.defaultFeatures": {
++  "ghcr.io/stanley-projects/insomnia/claude-code-stay-awake:1": {}
++}
++```
++
++## Options
++
++| Option | Default | Description |
++|---|---|---|
++| `hostAddress` | `host.docker.internal` | How the container reaches the PC running Insomnia. |
++| `bridgePort` | `47391` | Insomnia's bridge port. Change only if you set `bridgePort` in Insomnia's `config.json`. |
++
++At runtime, environment variables override these: `INSOMNIA_URL` (e.g. `http://host.docker.internal:47391`) and `INSOMNIA_DISABLED=1` to switch the hook off.
++
++## How it works
++
++- The feature installs `/usr/local/share/insomnia/claude-hook.sh` and registers it through Claude Code's managed-settings drop-in folder (`/etc/claude-code/managed-settings.d/50-insomnia.json`, Claude Code 2.1.83+). That lives in the image, so it works even when `~/.claude` is a mounted volume, never touches your own `settings.json`, and covers both the `claude` CLI and the VS Code extension in the container.
++- On each hook event the script posts the event to Insomnia's loopback endpoint on the host (`http://host.docker.internal:47391`). Docker Desktop forwards that name to the Windows host.
++- While a turn is open it sends a heartbeat every 60 seconds. Windows can't see processes inside the container, so the heartbeat is how Insomnia tells a long build (stay awake) from a container that has stopped (let the PC sleep within about 2½ minutes). The heartbeat stops when the turn ends, when Claude exits, or after 6 hours at most.
++- It never gets in Claude's way: no output, always exits 0, 1-second connect timeout. If Insomnia isn't running, nothing happens.
++- It needs `curl` or `wget`; the feature installs `curl` if the image has neither.
++
++## Firewalled containers
++
++Containers that block outbound traffic — such as Anthropic's reference Claude Code dev container with its `init-firewall.sh` — also block the host bridge. Allow it in the firewall script, before the final `REJECT` rule:
++
++```bash
++# Let Claude Code hooks reach Insomnia on the host
++INSOMNIA_IP=$(getent hosts host.docker.internal | awk '{print $1; exit}')
++if [ -n "$INSOMNIA_IP" ]; then
++  iptables -A OUTPUT -p tcp -d "$INSOMNIA_IP" --dport 47391 -j ACCEPT
++fi
++```
++
++## Troubleshooting
++
++From a terminal inside the container:
++
++```bash
++curl -s http://host.docker.internal:47391/v1/ping
++# {"app":"insomnia","version":"…","integrations":{"claude-code":true}}
++```
++
++- **Connection refused / no answer** — Insomnia isn't running on the host, its Claude Code integration is off, or something else holds port 47391 (set `bridgePort` in both places).
++- **`"claude-code": false`** — switch the Claude Code integration on in Insomnia.
++- **`host.docker.internal` doesn't resolve** — you're not on Docker Desktop. On Docker Engine for Linux, add `"runArgs": ["--add-host=host.docker.internal:host-gateway"]`; note that Insomnia listens on Windows' loopback, which a Docker Engine running inside WSL can only reach with WSL's mirrored networking mode.
+diff --git a/devcontainer-features/src/claude-code-stay-awake/claude-hook.sh b/devcontainer-features/src/claude-code-stay-awake/claude-hook.sh
+new file mode 100755
+index 0000000..865888d
+--- /dev/null
++++ b/devcontainer-features/src/claude-code-stay-awake/claude-hook.sh
+@@ -0,0 +1,186 @@
++#!/bin/sh
++# Insomnia — Claude Code hook for dev containers (also usable in WSL).
++#
++# Claude Code runs this for each hook event, with the event's JSON on stdin.
++# It forwards the event to Insomnia on the Windows host, and while a turn is
++# open it sends a heartbeat every minute. Windows cannot see processes inside
++# the container, so the heartbeat is how Insomnia tells a long build (keep the
++# PC awake) from a session that has gone away (let it sleep).
++#
++# A hook must never get in Claude's way: nothing on stdout, always exit 0,
++# short network timeouts, and the heartbeat runs fully detached.
++#
++# Environment (overrides insomnia.conf next to this script):
++#   INSOMNIA_URL                 bridge base URL (default http://host.docker.internal:47391)
++#   INSOMNIA_DISABLED=1          do nothing
++#   INSOMNIA_HEARTBEAT_INTERVAL  seconds between heartbeats (default 60)
++
++umask 077
++
++# Talk to the host directly, never through a corporate proxy.
++unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
++
++SELF=$0
++INSTALL_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
++CONFIG_FILE="$INSTALL_DIR/insomnia.conf"
++
++config_value() {
++  [ -r "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" 2>/dev/null | head -n 1
++}
++
++BASE_URL=${INSOMNIA_URL:-$(config_value url)}
++BASE_URL=${BASE_URL:-http://host.docker.internal:47391}
++BASE_URL=${BASE_URL%/}
++
++INTERVAL=${INSOMNIA_HEARTBEAT_INTERVAL:-60}
++case $INTERVAL in ''|*[!0-9]*) INTERVAL=60 ;; esac
++[ "$INTERVAL" -lt 1 ] && INTERVAL=1
++MAX_SECONDS=21600 # a heartbeat never outlives 6 hours, whatever happens
++
++STATE_DIR="${TMPDIR:-/tmp}/insomnia-$(id -u 2>/dev/null || echo 0)"
++
++detect_origin() {
++  if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${REMOTE_CONTAINERS:-}" ] || [ -n "${CODESPACES:-}" ]; then
++    echo devcontainer
++  elif [ -n "${WSL_DISTRO_NAME:-}" ] || [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then
++    echo wsl
++  else
++    echo remote
++  fi
++}
++ORIGIN=$(detect_origin)
++HOST_LABEL=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
++HOST_LABEL=$(printf '%s' "$HOST_LABEL" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
++
++with_timeout() {
++  _secs=$1; shift
++  if command -v timeout >/dev/null 2>&1; then timeout "$_secs" "$@"; else "$@"; fi
++}
++
++# http_post <path> <body-file> — prints the response body, fails quietly.
++http_post() {
++  if command -v curl >/dev/null 2>&1; then
++    curl -sS -f --noproxy '*' --connect-timeout 1 --max-time 3 \
++      -H 'Content-Type: application/json' \
++      -H "X-Insomnia-Origin: $ORIGIN" -H "X-Insomnia-Host: $HOST_LABEL" \
++      --data-binary "@$2" "$BASE_URL$1" 2>/dev/null
++  elif command -v wget >/dev/null 2>&1; then
++    with_timeout 4 wget -q -O - -T 3 \
++      --header='Content-Type: application/json' \
++      --header="X-Insomnia-Origin: $ORIGIN" --header="X-Insomnia-Host: $HOST_LABEL" \
++      --post-file="$2" "$BASE_URL$1" 2>/dev/null
++  else
++    return 1
++  fi
++}
++
++# json_field <name> <file> — first "name":"value" in the head of the event.
++# Claude Code writes session_id and hook_event_name before the (possibly huge)
++# tool input/output, so the first 16 KB always hold them.
++json_field() {
++  head -c 16384 "$2" 2>/dev/null | tr -d '\r\n' \
++    | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -n 1 \
++    | sed 's/^.*:[[:space:]]*"\(.*\)"$/\1/'
++}
++
++# The Claude process that ran this hook: the nearest ancestor named claude*
++# (the native binary is "claude"; an npm install shows up as "claude.exe").
++find_claude_pid() {
++  _pid=$PPID
++  _depth=0
++  while [ -n "$_pid" ] && [ "$_pid" -gt 1 ] 2>/dev/null && [ "$_depth" -lt 8 ]; do
++    _comm=$(cat "/proc/$_pid/comm" 2>/dev/null) || return 0
++    case $_comm in claude*) echo "$_pid"; return 0 ;; esac
++    _stat=$(cat "/proc/$_pid/stat" 2>/dev/null) || return 0
++    _stat=${_stat##*) }   # drop "pid (comm) " — comm may contain spaces
++    # shellcheck disable=SC2086
++    set -- $_stat         # now: state ppid ...
++    _pid=$2
++    _depth=$((_depth + 1))
++  done
++  return 0
++}
++
++# Is <pid> our heartbeat for <session>? Guards against a recycled pid.
++is_heartbeat_process() {
++  tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q -- "--heartbeat $2"
++}
++
++ensure_heartbeat() {
++  _pidfile="$STATE_DIR/heartbeat-$1.pid"
++  if [ -r "$_pidfile" ]; then
++    _hb=$(cat "$_pidfile" 2>/dev/null)
++    case $_hb in
++      ''|*[!0-9]*) ;;
++      *) if kill -0 "$_hb" 2>/dev/null && is_heartbeat_process "$_hb" "$1"; then return 0; fi ;;
++    esac
++  fi
++  _claude=$(find_claude_pid)
++  # Detached, with no inherited pipes: Claude Code waits for a hook's output to
++  # close, so anything still attached would stall it.
++  if command -v setsid >/dev/null 2>&1; then
++    setsid sh "$SELF" --heartbeat "$1" "$_claude" </dev/null >/dev/null 2>&1 &
++  else
++    nohup sh "$SELF" --heartbeat "$1" "$_claude" </dev/null >/dev/null 2>&1 &
++  fi
++  return 0
++}
++
++run_heartbeat() {
++  sid=$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-')
++  claude_pid=$2
++  [ -n "$sid" ] || return 0
++  trap '' HUP
++  pidfile="$STATE_DIR/heartbeat-$sid.pid"
++  turnfile="$STATE_DIR/turn-$sid"
++  body="$STATE_DIR/heartbeat-$sid.$$.json"
++  echo $$ > "$pidfile"
++  printf '{"session_id":"%s"}' "$sid" > "$body"
++  started=$(date +%s)
++  while :; do
++    sleep "$INTERVAL"
++    [ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] || break    # replaced by a newer heartbeat
++    [ "$(cat "$turnfile" 2>/dev/null)" = open ] || break    # turn ended
++    if [ -n "$claude_pid" ] && ! kill -0 "$claude_pid" 2>/dev/null; then break; fi  # Claude exited
++    [ $(( $(date +%s) - started )) -lt "$MAX_SECONDS" ] || break
++    resp=$(http_post /v1/heartbeat/claude-code "$body")
++    case $resp in *turn=closed*) break ;; esac              # Insomnia saw the turn end
++  done
++  [ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile"
++  rm -f "$body"
++}
++
++owned_by_me() {
++  [ -n "$(find "$1" -maxdepth 0 -user "$(id -u)" 2>/dev/null)" ]
++}
++
++handle_event() {
++  if [ "${INSOMNIA_DISABLED:-}" = 1 ]; then cat >/dev/null 2>&1; return 0; fi
++  mkdir -p "$STATE_DIR" 2>/dev/null
++  # The state folder holds pid files we act on; never use one someone else made.
++  if [ ! -d "$STATE_DIR" ] || ! owned_by_me "$STATE_DIR"; then cat >/dev/null 2>&1; return 0; fi
++  evt=$(mktemp "$STATE_DIR/event.XXXXXX" 2>/dev/null) || { cat >/dev/null 2>&1; return 0; }
++  cat > "$evt" 2>/dev/null
++
++  event=$(json_field hook_event_name "$evt")
++  sid=$(json_field session_id "$evt" | tr -cd 'A-Za-z0-9._-')
++
++  http_post /v1/hooks/claude-code "$evt" >/dev/null 2>&1
++  rm -f "$evt"
++
++  [ -n "$sid" ] || return 0
++  case $event in
++    Stop|StopFailure) printf closed > "$STATE_DIR/turn-$sid" ;;
++    SessionEnd)       rm -f "$STATE_DIR/turn-$sid" ;;
++    Notification|'')  ;;
++    *)                printf open > "$STATE_DIR/turn-$sid"; ensure_heartbeat "$sid" ;;
++  esac
++  return 0
++}
++
++if [ "${1:-}" = --heartbeat ]; then
++  run_heartbeat "${2:-}" "${3:-}"
++else
++  handle_event
++fi
++exit 0
+diff --git a/devcontainer-features/src/claude-code-stay-awake/devcontainer-feature.json b/devcontainer-features/src/claude-code-stay-awake/devcontainer-feature.json
+new file mode 100644
+index 0000000..2ccb544
+--- /dev/null
++++ b/devcontainer-features/src/claude-code-stay-awake/devcontainer-feature.json
+@@ -0,0 +1,26 @@
++{
++  "id": "claude-code-stay-awake",
++  "version": "1.0.0",
++  "name": "Insomnia: keep the host awake for Claude Code",
++  "description": "Tells Insomnia on your Windows host when Claude Code in this container is working, so the PC doesn't fall asleep mid-task.",
++  "documentationURL": "https://github.com/stanley-projects/Insomnia/tree/master/devcontainer-features/src/claude-code-stay-awake",
++  "licenseURL": "https://github.com/stanley-projects/Insomnia/blob/master/LICENSE",
++  "keywords": ["claude", "claude-code", "sleep", "insomnia", "windows"],
++  "options": {
++    "hostAddress": {
++      "type": "string",
++      "default": "host.docker.internal",
++      "proposals": ["host.docker.internal", "host.containers.internal"],
++      "description": "Host name (or IPv4 address) the container uses to reach the PC running Insomnia."
++    },
++    "bridgePort": {
++      "type": "string",
++      "default": "47391",
++      "description": "Port of Insomnia's dev container bridge. Change only if you set bridgePort in Insomnia's config.json."
++    }
++  },
++  "installsAfter": [
++    "ghcr.io/devcontainers/features/common-utils",
++    "ghcr.io/anthropics/devcontainer-features/claude-code"
++  ]
++}
+diff --git a/devcontainer-features/src/claude-code-stay-awake/insomnia-hooks.json b/devcontainer-features/src/claude-code-stay-awake/insomnia-hooks.json
+new file mode 100644
+index 0000000..f340770
+--- /dev/null
++++ b/devcontainer-features/src/claude-code-stay-awake/insomnia-hooks.json
+@@ -0,0 +1,92 @@
++{
++  "hooks": {
++    "UserPromptSubmit": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ],
++    "PreToolUse": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ],
++    "PostToolUse": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ],
++    "PostToolUseFailure": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ],
++    "PermissionRequest": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ],
++    "Stop": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ],
++    "StopFailure": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ],
++    "SessionEnd": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/usr/local/share/insomnia/claude-hook.sh",
++            "timeout": 10
++          }
++        ]
++      }
++    ]
++  }
++}
+diff --git a/devcontainer-features/src/claude-code-stay-awake/install.sh b/devcontainer-features/src/claude-code-stay-awake/install.sh
+new file mode 100755
+index 0000000..b851022
+--- /dev/null
++++ b/devcontainer-features/src/claude-code-stay-awake/install.sh
+@@ -0,0 +1,67 @@
++#!/bin/sh
++# Dev Container Feature install script — runs as root while the image builds.
++#
++# Installs the Insomnia hook for Claude Code and registers it through Claude
++# Code's managed-settings drop-in folder. That folder lives in /etc, inside the
++# image, so it works even when ~/.claude is a mounted volume (as in Anthropic's
++# reference dev container), never touches the user's own settings.json, and
++# applies to the CLI and the VS Code extension alike.
++set -eu
++
++FEATURE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
++INSTALL_DIR=/usr/local/share/insomnia
++MANAGED_DIR=/etc/claude-code/managed-settings.d
++
++# Feature options arrive as upper-cased environment variables.
++HOST_ADDRESS=${HOSTADDRESS:-host.docker.internal}
++BRIDGE_PORT=${BRIDGEPORT:-47391}
++
++case $BRIDGE_PORT in
++  ''|*[!0-9]*) echo "insomnia: bridgePort must be a number, got '$BRIDGE_PORT'" >&2; exit 1 ;;
++esac
++if [ "$BRIDGE_PORT" -lt 1 ] || [ "$BRIDGE_PORT" -gt 65535 ]; then
++  echo "insomnia: bridgePort out of range: $BRIDGE_PORT" >&2; exit 1
++fi
++case $HOST_ADDRESS in
++  ''|*[!A-Za-z0-9._:-]*) echo "insomnia: hostAddress must be a host name or IPv4 address, got '$HOST_ADDRESS'" >&2; exit 1 ;;
++esac
++
++echo "insomnia: installing Claude Code hook (reports to http://$HOST_ADDRESS:$BRIDGE_PORT)"
++
++CREATED_MANAGED_DIR=false
++[ -d "$MANAGED_DIR" ] || CREATED_MANAGED_DIR=true
++
++mkdir -p "$INSTALL_DIR" "$MANAGED_DIR"
++cp "$FEATURE_DIR/claude-hook.sh" "$INSTALL_DIR/claude-hook.sh"
++chmod 0755 "$INSTALL_DIR" "$INSTALL_DIR/claude-hook.sh"
++printf 'url=http://%s:%s\n' "$HOST_ADDRESS" "$BRIDGE_PORT" > "$INSTALL_DIR/insomnia.conf"
++chmod 0644 "$INSTALL_DIR/insomnia.conf"
++
++# A real file, not a link: Claude Code warns about links that point outside
++# the managed settings folder.
++cp "$FEATURE_DIR/insomnia-hooks.json" "$MANAGED_DIR/50-insomnia.json"
++chmod 0644 "$MANAGED_DIR/50-insomnia.json"
++# Readable by the (non-root) user Claude runs as; existing folders keep their mode.
++if [ "$CREATED_MANAGED_DIR" = true ]; then chmod 0755 /etc/claude-code "$MANAGED_DIR"; fi
++
++# The hook needs curl or wget to reach the host.
++if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
++  echo "insomnia: neither curl nor wget found, installing curl"
++  if command -v apt-get >/dev/null 2>&1; then
++    export DEBIAN_FRONTEND=noninteractive
++    { apt-get update -y && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*; } \
++      || echo "insomnia: warning: could not install curl" >&2
++  elif command -v apk >/dev/null 2>&1; then
++    apk add --no-cache curl || echo "insomnia: warning: could not install curl" >&2
++  elif command -v dnf >/dev/null 2>&1; then
++    dnf install -y curl || echo "insomnia: warning: could not install curl" >&2
++  elif command -v microdnf >/dev/null 2>&1; then
++    microdnf install -y curl || echo "insomnia: warning: could not install curl" >&2
++  elif command -v yum >/dev/null 2>&1; then
++    yum install -y curl || echo "insomnia: warning: could not install curl" >&2
++  else
++    echo "insomnia: warning: no curl or wget and no known package manager; the hook will be inactive" >&2
++  fi
++fi
++
++echo "insomnia: done"
+diff --git a/devcontainer-features/test/claude-code-stay-awake/test.sh b/devcontainer-features/test/claude-code-stay-awake/test.sh
+new file mode 100755
+index 0000000..b56efa5
+--- /dev/null
++++ b/devcontainer-features/test/claude-code-stay-awake/test.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++# Run by `devcontainer features test` inside a container built with the feature.
++set -e
++
++# shellcheck source=/dev/null
++source dev-container-features-test-lib
++
++HOOK=/usr/local/share/insomnia/claude-hook.sh
++DROPIN=/etc/claude-code/managed-settings.d/50-insomnia.json
++
++check "hook script installed and executable" test -x "$HOOK"
++check "bridge address configured" grep -q '^url=http://host.docker.internal:47391$' /usr/local/share/insomnia/insomnia.conf
++check "managed-settings drop-in installed" test -f "$DROPIN"
++check "drop-in registers the hook for Stop" grep -q '"Stop"' "$DROPIN"
++check "drop-in readable by every user" bash -c "[ \"\$(stat -c %a $DROPIN)\" = 644 ]"
++check "an HTTP client is available" bash -c 'command -v curl || command -v wget'
++# With no Insomnia reachable the hook must stay silent, succeed, and be quick.
++check "hook exits 0 and prints nothing when the host is unreachable" bash -c \
++  "out=\$(echo '{\"session_id\":\"t1\",\"hook_event_name\":\"UserPromptSubmit\"}' | INSOMNIA_URL=http://127.0.0.1:9 timeout 5 $HOOK); [ \$? -eq 0 ] && [ -z \"\$out\" ]"
++check "Stop is accepted and closes the turn" bash -c \
++  "echo '{\"session_id\":\"t1\",\"hook_event_name\":\"Stop\"}' | INSOMNIA_URL=http://127.0.0.1:9 timeout 5 $HOOK && grep -qx closed \"\${TMPDIR:-/tmp}/insomnia-\$(id -u)/turn-t1\""
++check "hook does nothing when disabled" bash -c \
++  "echo '{}' | INSOMNIA_DISABLED=1 $HOOK"
++
++reportResults
+diff --git a/docs/llms-full.txt b/docs/llms-full.txt
+index e54884f..85373d9 100644
+--- a/docs/llms-full.txt
++++ b/docs/llms-full.txt
+@@ -21,7 +21,7 @@ When AI coding tools like Claude Code or Aider run long tasks, the PC can fall a
+ ## Features (complete list)
+ 
+ ### Smart AI integrations
+-- **Claude Code**: Hook-based via `~/.claude/settings.json`. Events: `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification` → stay awake; `SessionEnd` → allow sleep.
++- **Claude Code**: Hook-based via `~/.claude/settings.json` (terminal and VS Code extension). Events: `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest` → activity; `Stop`, `StopFailure` → turn over; `SessionEnd` → session gone. A running tool call keeps the PC awake up to 30 minutes. Dev containers: the `claude-code-stay-awake` Dev Container Feature reports to Insomnia's loopback bridge (`host.docker.internal:47391`) with a heartbeat while a turn is open.
+ - **Cursor**: Polls `~/.cursor/projects/*/agent-transcripts/**/*.jsonl` every 5 seconds. Files written during active Agent sessions; stays awake while any transcript changes.
+ - **OpenAI Codex**: Dual-path. CLI uses `notify = ["node", "<hook>", "stay-awake", "codex-cli"]` in `~/.codex/config.toml`. VS Code extension and standalone app use session transcript polling at `~/.codex/sessions/**/*.jsonl`.
+ 
+diff --git a/hook-bridge.js b/hook-bridge.js
+new file mode 100644
+index 0000000..b817d53
+--- /dev/null
++++ b/hook-bridge.js
+@@ -0,0 +1,226 @@
++/**
++ * Hook bridge: a loopback HTTP endpoint for agents that run where Insomnia's
++ * own hook cannot.
++ *
++ * Claude Code inside a dev container (or WSL) runs its hooks in Linux. Those
++ * hooks cannot run the Windows launcher or write to %USERPROFILE%\.insomnia, and
++ * Windows cannot see the Linux `claude` process to tell a long build from a dead
++ * session. The container-side hook (devcontainer-features/) therefore POSTs each
++ * hook event here instead, plus a heartbeat every minute while a turn is open,
++ * and this records them through the same session-store rules a local hook uses.
++ *
++ * Reached from a container as http://host.docker.internal:<port> — Docker
++ * Desktop forwards that name to the Windows loopback — so it listens on
++ * 127.0.0.1 only and is never exposed to the network.
++ *
++ *   GET  /v1/ping                       -> {"app":"insomnia",...}
++ *   POST /v1/hooks/<integration>        body: the hook's JSON input, as-is
++ *   POST /v1/heartbeat/<integration>    body: {"session_id": "..."}
++ *
++ * Responses are plain `key=value` lines so a POSIX shell can read them:
++ *   ok / session=<id> / turn=open|closed|none
++ *
++ * No Electron dependency, so it can be tested under plain Node.
++ */
++
++'use strict';
++
++const http = require('http');
++const store = require('./session-store');
++
++const DEFAULT_BRIDGE_PORT = 47391;
++const MAX_BODY_BYTES = 32 * 1024 * 1024; // PostToolUse inputs carry tool output
++const RETRY_LISTEN_MS = 60 * 1000;
++const SUPPORTED_INTEGRATIONS = new Set(['claude-code']);
++
++// Host names a legitimate caller uses to reach us. Anything else — notably a
++// web page that DNS-rebinds its own name to 127.0.0.1 — is refused.
++const ALLOWED_HOSTNAMES = [
++  '127.0.0.1',
++  'localhost',
++  '::1',
++  'host.docker.internal',      // Docker Desktop
++  'gateway.docker.internal',
++  'host.containers.internal',  // Podman
++  'host.lima.internal',        // Rancher Desktop / Lima
++  'host.orb.internal'          // OrbStack
++];
++
++function hostnameOf(hostHeader) {
++  if (typeof hostHeader !== 'string') return '';
++  const h = hostHeader.trim().toLowerCase();
++  if (h.startsWith('[')) {
++    const end = h.indexOf(']');
++    return end > 0 ? h.slice(1, end) : '';
++  }
++  const colon = h.lastIndexOf(':');
++  return colon > -1 ? h.slice(0, colon) : h;
++}
++
++function cleanLabel(value, max) {
++  if (typeof value !== 'string') return '';
++  return value.replace(/[^A-Za-z0-9._-]/g, '').slice(0, max);
++}
++
++function readBody(req, limit, callback) {
++  const chunks = [];
++  let size = 0;
++  let failed = false;
++  req.on('data', chunk => {
++    if (failed) return;
++    size += chunk.length;
++    if (size > limit) {
++      failed = true;
++      callback(Object.assign(new Error('too large'), { status: 413 }));
++      req.resume(); // drain and discard the rest
++      return;
++    }
++    chunks.push(chunk);
++  });
++  req.on('end', () => { if (!failed) callback(null, Buffer.concat(chunks).toString('utf8')); });
++  req.on('error', err => { if (!failed) { failed = true; callback(err); } });
++}
++
++function createHookBridge(options = {}) {
++  const {
++    port = DEFAULT_BRIDGE_PORT,
++    host = '127.0.0.1',
++    sessionsFile = store.SESSIONS_FILE,
++    isEnabled = () => true,
++    onActivity = () => {},
++    version = '',
++    extraAllowedHosts = [],
++    log = () => {}
++  } = options;
++
++  const allowedHosts = new Set([
++    ...ALLOWED_HOSTNAMES,
++    ...extraAllowedHosts.map(h => String(h).toLowerCase())
++  ]);
++
++  let server = null;
++  let listening = false;
++  let retryTimer = null;
++  let wanted = false;
++
++  function send(res, status, body, type = 'text/plain; charset=utf-8') {
++    res.writeHead(status, {
++      'Content-Type': type,
++      'Cache-Control': 'no-store',
++      'X-Content-Type-Options': 'nosniff'
++    });
++    res.end(body);
++  }
++
++  function handle(req, res) {
++    // Only programs talk to this endpoint. Browsers attach an Origin header to
++    // every POST, so refusing it shuts out any web page outright.
++    if (req.headers.origin) return send(res, 403, 'forbidden\n');
++    if (!allowedHosts.has(hostnameOf(req.headers.host))) return send(res, 403, 'forbidden\n');
++
++    let url;
++    try { url = new URL(req.url, 'http://bridge.invalid'); }
++    catch { return send(res, 400, 'bad request\n'); }
++
++    if (url.pathname === '/v1/ping') {
++      if (req.method !== 'GET') return send(res, 405, 'method not allowed\n');
++      const integrations = {};
++      for (const id of SUPPORTED_INTEGRATIONS) integrations[id] = !!isEnabled(id);
++      return send(res, 200, JSON.stringify({ app: 'insomnia', version, integrations }) + '\n', 'application/json');
++    }
++
++    const parts = url.pathname.split('/').filter(Boolean);
++    if (parts.length !== 3 || parts[0] !== 'v1' || !['hooks', 'heartbeat'].includes(parts[1])) {
++      return send(res, 404, 'not found\n');
++    }
++    const [, kind, integration] = parts;
++    if (!SUPPORTED_INTEGRATIONS.has(integration)) return send(res, 404, 'not found\n');
++    if (req.method !== 'POST') return send(res, 405, 'method not allowed\n');
++    // A JSON content type cannot be sent cross-site without a CORS preflight,
++    // which this server never approves.
++    if (!String(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
++      return send(res, 415, 'expected application/json\n');
++    }
++
++    readBody(req, MAX_BODY_BYTES, (err, raw) => {
++      if (err) return send(res, err.status || 400, 'bad request\n');
++
++      let input;
++      try { input = JSON.parse(raw); } catch { return send(res, 400, 'bad json\n'); }
++      if (!input || typeof input !== 'object' || Array.isArray(input)) return send(res, 400, 'bad json\n');
++
++      if (!isEnabled(integration)) return send(res, 200, 'ok\nignored=disabled\n');
++
++      // Whatever the caller says, a bridged session is never "local": that would
++      // let it borrow liveness from an unrelated claude.exe on this PC.
++      let origin = cleanLabel(req.headers['x-insomnia-origin'], 32) || 'remote';
++      if (origin === 'local') origin = 'remote';
++      const remoteHost = cleanLabel(req.headers['x-insomnia-host'], 64);
++
++      let result;
++      try {
++        result = store.updateSessions(data => store.applyHookEvent(data, {
++          integration,
++          command: kind === 'heartbeat' ? 'heartbeat' : 'stay-awake',
++          input: kind === 'heartbeat' ? { session_id: input.session_id } : input,
++          origin,
++          host: remoteHost
++        }), sessionsFile);
++      } catch (e) {
++        log(`hook bridge: could not record event: ${e && e.message}`);
++        return send(res, 500, 'error\n');
++      }
++
++      try { onActivity(); } catch {}
++
++      const session = result && result.session;
++      const turn = !session ? 'none' : (session.turn_open === false ? 'closed' : 'open');
++      const sid = cleanLabel(session ? session.session_id : '', 200);
++      send(res, 200, `ok\nsession=${sid}\nturn=${turn}\n`);
++    });
++  }
++
++  function listen() {
++    if (!wanted || server) return;
++    const srv = http.createServer(handle);
++    srv.requestTimeout = 15000;
++    srv.headersTimeout = 10000;
++    srv.keepAliveTimeout = 1000;
++    srv.on('error', err => {
++      listening = false;
++      if (server === srv) server = null;
++      try { srv.close(); } catch {}
++      log(`hook bridge: cannot listen on ${host}:${port} (${err && err.code || err}); retrying in ${RETRY_LISTEN_MS / 1000}s`);
++      if (wanted && !retryTimer) {
++        retryTimer = setTimeout(() => { retryTimer = null; listen(); }, RETRY_LISTEN_MS);
++        if (retryTimer.unref) retryTimer.unref();
++      }
++    });
++    srv.listen(port, host, () => {
++      listening = true;
++      const addr = srv.address();
++      log(`hook bridge: listening on http://${host}:${addr && addr.port}`);
++    });
++    server = srv;
++  }
++
++  return {
++    start() { wanted = true; listen(); },
++    stop() {
++      wanted = false;
++      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
++      if (server) { try { server.close(); } catch {} server = null; }
++      listening = false;
++    },
++    get listening() { return listening; },
++    get port() { return port; },
++    get address() { return server && listening ? server.address() : null; }
++  };
++}
++
++module.exports = {
++  DEFAULT_BRIDGE_PORT,
++  ALLOWED_HOSTNAMES,
++  createHookBridge,
++  hostnameOf
++};
+diff --git a/main.js b/main.js
+index 4698fca..c6a219f 100644
+--- a/main.js
++++ b/main.js
+@@ -3,6 +3,8 @@ const path = require('path');
+ const fs = require('fs');
+ const os = require('os');
+ const { execFile, spawn } = require('child_process');
++const store = require('./session-store');
++const { createHookBridge, DEFAULT_BRIDGE_PORT } = require('./hook-bridge');
+ 
+ // ── State ──────────────────────────────────────────────────────────────────────
+ let mainWindow = null;
+@@ -16,6 +18,11 @@ let activeIntegrations = [];
+ let config = { manualAwake: false, watchedApps: [], watchedIntegrations: [] };
+ let processLastSeen = {}; // integrationId → timestamp, for process-based grace period
+ let appLastSeen = {};     // exe.toLowerCase() → timestamp, for watched apps grace period
++// Last tasklist output. Session checks triggered by a hook (file watcher, dev
++// container bridge) reuse it rather than assuming no process is running — that
++// assumption dropped the long-tool-call grace for up to 10s on every hook.
++let lastTasklistLower = '';
++let hookBridge = null;
+ 
+ const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
+ const ASSETS = path.join(__dirname, 'assets');
+@@ -23,22 +30,17 @@ const ASSETS = path.join(__dirname, 'assets');
+ const HOOK_SCRIPT = app.isPackaged
+   ? path.join(__dirname.replace('app.asar', 'app.asar.unpacked'), 'agent-hook.js')
+   : path.join(__dirname, 'agent-hook.js');
+-const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
+-const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
++const { SESSIONS_DIR, SESSIONS_FILE, SESSION_TIMEOUT_MS } = store;
+ // Hook launcher: a tiny .cmd shim so hooks never depend on the user having Node
+ // installed. It runs the app's own bundled Electron binary in Node mode, so a
+ // fresh install works on a machine with no Node runtime at all.
+ const HOOK_LAUNCHER = path.join(SESSIONS_DIR, 'insomnia-hook.cmd');
+-const SESSION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes — timeout between hook events
++// Hook-based integrations without turn tracking (Codex, Cursor): while their
++// process is alive, a session stays awake this long after its last activity.
+ const SESSION_PROCESS_GRACE_MS = 5 * 60 * 1000; // 5 minutes — covers long AI responses with no tool calls
+-// Integrations that tell us explicitly when a turn ends (Claude Code's Stop hook)
+-// get a much longer grace while a turn is still open. Nothing fires during a
+-// single long tool call — a 10-minute build or test run — so the old 5-minute
+-// grace expired mid-work and the machine slept during exactly the workload this
+-// app exists to protect. Safe to be generous here only because the Stop hook
+-// deletes the session the moment the turn finishes, so an idle session does not
+-// sit on this timer.
+-const SESSION_TURN_GRACE_MS = 30 * 60 * 1000; // 30 minutes — long tool call still running
++// Claude Code reports turns and tool calls explicitly, so it uses the
++// turn-aware rules in session-store.js instead (3 min after any hook, up to
++// 30 min while a tool call is still running or an open turn can be trusted).
+ const PROCESS_GRACE_MS = 30 * 1000; // 30 seconds — grace period for process-based integrations/apps after process disappears
+ 
+ // ── Available Integrations ─────────────────────────────────────────────────────
+@@ -46,11 +48,15 @@ const INTEGRATIONS = [
+   {
+     id: 'claude-code',
+     name: 'Claude Code',
+-    description: 'Keeps PC awake while Claude is actively working on tasks',
++    description: 'Keeps PC awake while Claude is actively working (terminal, VS Code, or a dev container)',
+     hookBased: true,
+-    // Claude Code fires a Stop hook at the end of every turn, so we are told when
+-    // work finishes instead of inferring it from silence.
++    // Claude Code's hooks report turns (UserPromptSubmit … Stop) and tool calls
++    // (PreToolUse / PostToolUse), so sessions are judged turn by turn — see
++    // isTurnSessionActive() in session-store.js — instead of by silence alone.
+     endOfTurnSignal: true,
++    // The terminal CLI and the VS Code extension (its bundled
++    // resources\native-binary\claude.exe) both show up as claude.exe. Sessions in
++    // a dev container are not visible here; they prove liveness by heartbeat.
+     processNames: ['claude.exe'],
+     icon: 'claude'
+   },
+@@ -244,6 +250,7 @@ function checkRunningProcesses() {
+   proc.stdout.on('data', d => { output += d.toString(); });
+   proc.on('close', () => {
+     const lower = output.toLowerCase();
++    lastTasklistLower = lower;
+ 
+     // Check apps — with 30s grace period so a brief disappearance doesn't instantly deactivate
+     const now = Date.now();
+@@ -283,7 +290,10 @@ function checkRunningProcesses() {
+ }
+ 
+ // ── Agent Session Monitoring (Hook-based integrations) ─────────────────────────
+-function checkAgentSessions(tasklistLower) {
++// Where a session is running, for the tray tooltip.
++const ORIGIN_LABELS = { devcontainer: 'dev container', wsl: 'WSL', remote: 'remote' };
++
++function checkAgentSessions(tasklistLower = lastTasklistLower) {
+   const hookIntegrations = config.watchedIntegrations
+     .filter(i => i.enabled)
+     .map(i => INTEGRATIONS.find(def => def.id === i.id))
+@@ -303,32 +313,35 @@ function checkAgentSessions(tasklistLower) {
+       return;
+     }
+ 
+-    const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
++    const data = store.readSessions(SESSIONS_FILE);
+     const now = Date.now();
+ 
+     for (const def of hookIntegrations) {
+-      // Check if any session for this integration has recent hook activity
+-      const hasRecentHook = Object.values(data.sessions || {}).some(s => {
+-        if (s.integration !== def.id) return false;
+-        const lastActivity = new Date(s.last_activity).getTime();
+-        return (now - lastActivity) < SESSION_TIMEOUT_MS;
+-      });
+-
+-      // Check if the process is still running (covers background tasks / idle gaps)
++      const sessions = Object.values(data.sessions || {}).filter(s => s && s.integration === def.id);
++
++      // Is the integration's process running on this PC? (Covers long tool
++      // calls and replies, during which no hook fires.)
+       const processAlive = def.processNames && tasklistLower
+         ? def.processNames.some(p => tasklistLower.includes(p.toLowerCase()))
+         : false;
+ 
+-      // If the process is alive, allow a longer grace period (long tool calls,
+-      // background builds). Integrations that release explicitly at end of turn
+-      // can be given a much longer one: a session only survives here while its
+-      // turn is genuinely still open.
+-      const graceMs = def.endOfTurnSignal ? SESSION_TURN_GRACE_MS : SESSION_PROCESS_GRACE_MS;
+-      const withinGracePeriod = Object.values(data.sessions || {}).some(s => {
+-        if (s.integration !== def.id) return false;
+-        const lastActivity = new Date(s.last_activity).getTime();
+-        return (now - lastActivity) < graceMs;
+-      });
++      if (def.endOfTurnSignal) {
++        // Claude Code: judged session by session, wherever it runs. Local
++        // sessions borrow claude.exe's liveness; dev container sessions carry
++        // their own heartbeat.
++        const active = sessions.filter(s => store.isTurnSessionActive(s, now, processAlive));
++        if (active.length > 0) {
++          const remoteOnly = active.every(s => store.isRemoteSession(s));
++          const where = remoteOnly ? (ORIGIN_LABELS[active[0].origin] || ORIGIN_LABELS.remote) : '';
++          activeIntegrations.push({ id: def.id, name: where ? `${def.name} (${where})` : def.name, reason: 'hook' });
++        }
++        continue;
++      }
++
++      // Everything else: recent activity, or a grace period while the process lives.
++      const lastActivities = sessions.map(s => new Date(s.last_activity).getTime()).filter(Number.isFinite);
++      const hasRecentHook = lastActivities.some(t => (now - t) < SESSION_TIMEOUT_MS);
++      const withinGracePeriod = lastActivities.some(t => (now - t) < SESSION_PROCESS_GRACE_MS);
+ 
+       if (hasRecentHook || (processAlive && withinGracePeriod)) {
+         activeIntegrations.push({ id: def.id, name: def.name, reason: 'hook' });
+@@ -343,6 +356,15 @@ function checkAgentSessions(tasklistLower) {
+ let sessionWatcher = null;
+ let watchDebounce = null;
+ 
++// Debounced re-check — hooks can fire in rapid succession.
++function scheduleSessionCheck() {
++  if (watchDebounce) clearTimeout(watchDebounce);
++  watchDebounce = setTimeout(() => {
++    watchDebounce = null;
++    checkAgentSessions();
++  }, 200);
++}
++
+ function watchSessionFile() {
+   // Ensure the directory and file exist before watching
+   if (!fs.existsSync(SESSIONS_DIR)) {
+@@ -353,12 +375,13 @@ function watchSessionFile() {
+   }
+ 
+   try {
+-    sessionWatcher = fs.watch(SESSIONS_FILE, () => {
+-      // Debounce — hooks can fire in rapid succession
+-      if (watchDebounce) clearTimeout(watchDebounce);
+-      watchDebounce = setTimeout(() => {
+-        checkAgentSessions();
+-      }, 200);
++    // Watch the folder, not the file: hooks now replace the file atomically
++    // (write a temp file, rename it over), and a watch on the old file would go
++    // quiet after the first replace on some platforms.
++    const sessionsName = path.basename(SESSIONS_FILE);
++    sessionWatcher = fs.watch(SESSIONS_DIR, (_event, filename) => {
++      if (filename && filename.toString() !== sessionsName) return;
++      scheduleSessionCheck();
+     });
+ 
+     sessionWatcher.on('error', () => {
+@@ -404,20 +427,10 @@ function recordCursorActivity() {
+   const isEnabled = config.watchedIntegrations.some(i => i.id === 'cursor' && i.enabled);
+   if (!isEnabled) return;
+   try {
+-    if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+-    let data = { sessions: {} };
+-    if (fs.existsSync(SESSIONS_FILE)) {
+-      try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch {}
+-    }
+-    if (!data.sessions) data.sessions = {};
+-    const key = 'cursor:agent';
+-    const nowIso = new Date().toISOString();
+-    if (!data.sessions[key]) {
+-      data.sessions[key] = { integration: 'cursor', session_id: 'agent', created_at: nowIso };
+-    }
+-    data.sessions[key].last_activity = nowIso;
+-    data.last_updated = nowIso;
+-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
++    // Records `cursor:agent` with a fresh last_activity (atomic write).
++    store.updateSessions(data => store.applyHookEvent(data, {
++      integration: 'cursor', command: 'stay-awake', input: { session_id: 'agent' }
++    }));
+     checkAgentSessions();
+   } catch {}
+ }
+@@ -521,20 +534,10 @@ function recordCodexActivity() {
+   const isEnabled = config.watchedIntegrations.some(i => i.id === 'codex-cli' && i.enabled);
+   if (!isEnabled) return;
+   try {
+-    if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+-    let data = { sessions: {} };
+-    if (fs.existsSync(SESSIONS_FILE)) {
+-      try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch {}
+-    }
+-    if (!data.sessions) data.sessions = {};
+-    const key = 'codex-cli:app-server';
+-    const nowIso = new Date().toISOString();
+-    if (!data.sessions[key]) {
+-      data.sessions[key] = { integration: 'codex-cli', session_id: 'app-server', created_at: nowIso };
+-    }
+-    data.sessions[key].last_activity = nowIso;
+-    data.last_updated = nowIso;
+-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
++    // Records `codex-cli:app-server` with a fresh last_activity (atomic write).
++    store.updateSessions(data => store.applyHookEvent(data, {
++      integration: 'codex-cli', command: 'stay-awake', input: { session_id: 'app-server' }
++    }));
+     checkAgentSessions();
+   } catch {}
+ }
+@@ -617,17 +620,56 @@ function ensureHookLauncher() {
+ // Any hook command Insomnia has ever written, across versions: the current .cmd
+ // shim, the older bare-`node` form, and the pre-rename cc-caffeine builds.
+ function isInsomniaHookCommand(command) {
+-  if (!command) return false;
++  if (!command || typeof command !== 'string') return false;
+   return command.includes('insomnia-hook.cmd')
+     || command.includes('agent-hook.js')
+     || command.includes('cc-caffeine');
+ }
+ 
++// A Claude Code hook handler Insomnia wrote: shell form (command string) or
++// exec form (cmd.exe with the launcher among its args).
++function isInsomniaHookHandler(handler) {
++  if (!handler || typeof handler !== 'object') return false;
++  if (isInsomniaHookCommand(handler.command)) return true;
++  return Array.isArray(handler.args) && handler.args.some(isInsomniaHookCommand);
++}
++
+ // ── Claude Code Hook Setup ─────────────────────────────────────────────────────
+ function getClaudeSettingsPath() {
+   return path.join(os.homedir(), '.claude', 'settings.json');
+ }
+ 
++function getCmdExePath() {
++  const comspec = process.env.ComSpec || process.env.COMSPEC;
++  if (comspec && /cmd\.exe$/i.test(comspec)) return comspec;
++  return path.join(process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows', 'System32', 'cmd.exe');
++}
++
++// The hook handler Claude Code runs for one of our commands.
++//
++// Claude Code runs a hook *string* through Git Bash on Windows — or through
++// PowerShell when it cannot find Git Bash, which is common with the VS Code
++// extension. The old string, `"C:\…\insomnia-hook.cmd" stay-awake claude-code`,
++// is a parse error in PowerShell (a quoted string followed by bare words), so on
++// those machines every Insomnia hook failed and Claude Code was never detected.
++//
++// Exec form (`args`, Claude Code 2.1.139+) avoids shells altogether: Claude Code
++// starts cmd.exe directly with an argument list. `.cmd` files cannot be started
++// that way themselves, hence cmd.exe /c. cmd keeps the quotes libuv puts around a
++// launcher path with spaces only while the path holds none of & < > ( ) @ ^ |;
++// for the rare profile folder that does, keep the shell form, which Git Bash runs.
++function buildClaudeHookHandler(hookCommand) {
++  if (process.platform === 'win32' && !/[&<>()@^|%!"]/.test(HOOK_LAUNCHER)) {
++    return {
++      type: 'command',
++      command: getCmdExePath(),
++      args: ['/d', '/c', HOOK_LAUNCHER, hookCommand, 'claude-code'],
++      timeout: 30
++    };
++  }
++  return { type: 'command', command: `"${HOOK_LAUNCHER}" ${hookCommand} claude-code`, timeout: 30 };
++}
++
+ function setupClaudeCodeHooks() {
+   const settingsPath = getClaudeSettingsPath();
+   let settings = {};
+@@ -636,22 +678,27 @@ function setupClaudeCodeHooks() {
+     if (fs.existsSync(settingsPath)) {
+       settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+     }
+-  } catch {}
++  } catch {
++    // Unreadable or hand-broken settings: leave the file alone rather than
++    // overwrite the user's other settings with just our hooks.
++    return;
++  }
+ 
+-  if (!settings.hooks) settings.hooks = {};
++  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+ 
+   ensureHookLauncher();
+ 
+-  const stayAwakeCmd = `"${HOOK_LAUNCHER}" stay-awake claude-code`;
+-  const allowSleepCmd = `"${HOOK_LAUNCHER}" allow-sleep claude-code`;
++  const stayAwakeHook = { hooks: [buildClaudeHookHandler('stay-awake')] };
++  const allowSleepHook = { hooks: [buildClaudeHookHandler('allow-sleep')] };
+ 
+-  const stayAwakeHook = { hooks: [{ type: 'command', command: stayAwakeCmd }] };
+-  const allowSleepHook = { hooks: [{ type: 'command', command: allowSleepCmd }] };
+-
+-  const stayAwakeEvents = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest', 'Notification'];
+-  // Stop fires when Claude finishes responding — the one unambiguous "work is
+-  // done" signal. SessionEnd covers the session going away entirely.
+-  const allowSleepEvents = ['Stop', 'SessionEnd'];
++  // Activity. The event name travels in the hook's JSON, so the hook script
++  // tells a new prompt from a tool starting or finishing (see session-store.js).
++  // Notification is deliberately absent: it also fires a minute *after* a turn
++  // ends ("waiting for your input") and used to re-arm the grace period then.
++  const stayAwakeEvents = ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest'];
++  // End of a turn: Stop when Claude finishes, StopFailure when an API error ends
++  // it instead. SessionEnd covers the session going away entirely.
++  const allowSleepEvents = ['Stop', 'StopFailure', 'SessionEnd'];
+ 
+   // Clear out hooks from every previous Insomnia build first — including events
+   // we no longer manage (older versions wrote a `Stop` hook) and stale absolute
+@@ -660,7 +707,7 @@ function setupClaudeCodeHooks() {
+   for (const event of Object.keys(settings.hooks)) {
+     if (!Array.isArray(settings.hooks[event])) continue;
+     settings.hooks[event] = settings.hooks[event].filter(h =>
+-      !h.hooks?.some(hh => isInsomniaHookCommand(hh.command))
++      !h.hooks?.some(isInsomniaHookHandler)
+     );
+     if (settings.hooks[event].length === 0) delete settings.hooks[event];
+   }
+@@ -675,6 +722,7 @@ function setupClaudeCodeHooks() {
+     settings.hooks[event].push(allowSleepHook);
+   }
+ 
++  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+ }
+ 
+@@ -686,8 +734,9 @@ function removeClaudeCodeHooks() {
+     if (!settings.hooks) return;
+ 
+     for (const event of Object.keys(settings.hooks)) {
++      if (!Array.isArray(settings.hooks[event])) continue;
+       settings.hooks[event] = settings.hooks[event].filter(h =>
+-        !h.hooks?.some(hh => isInsomniaHookCommand(hh.command))
++        !h.hooks?.some(isInsomniaHookHandler)
+       );
+       if (settings.hooks[event].length === 0) {
+         delete settings.hooks[event];
+@@ -805,15 +854,42 @@ function removeCodexHooks() {
+   } catch {}
+ }
+ 
++// ── Dev container bridge ───────────────────────────────────────────────────────
++// Claude Code inside a dev container runs its hooks in Linux, where neither the
++// launcher nor %USERPROFILE%\.insomnia exist. The container-side hook (see
++// devcontainer-features/) reports to this loopback endpoint instead, which
++// Docker Desktop exposes to containers as host.docker.internal.
++function getBridgePort() {
++  const port = Number(config.bridgePort);
++  return Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_BRIDGE_PORT;
++}
++
++function startHookBridge() {
++  if (!hookBridge) {
++    hookBridge = createHookBridge({
++      port: getBridgePort(),
++      isEnabled: id => config.watchedIntegrations.some(i => i.id === id && i.enabled),
++      onActivity: scheduleSessionCheck,
++      version: app.getVersion(),
++      log: msg => console.log(msg)
++    });
++  }
++  hookBridge.start();
++}
++
++function stopHookBridge() {
++  if (hookBridge) hookBridge.stop();
++}
++
+ // ── Hook dispatch ──────────────────────────────────────────────────────────────
+ function setupHooksForIntegration(integrationId) {
+-  if (integrationId === 'claude-code') setupClaudeCodeHooks();
++  if (integrationId === 'claude-code') { setupClaudeCodeHooks(); startHookBridge(); }
+   else if (integrationId === 'codex-cli') { setupCodexHooks(); watchCodexFiles(); }
+   else if (integrationId === 'cursor') watchCursorFiles();
+ }
+ 
+ function removeHooksForIntegration(integrationId) {
+-  if (integrationId === 'claude-code') removeClaudeCodeHooks();
++  if (integrationId === 'claude-code') { removeClaudeCodeHooks(); stopHookBridge(); }
+   else if (integrationId === 'codex-cli') { removeCodexHooks(); stopCodexWatcher(); }
+   else if (integrationId === 'cursor') stopCursorWatcher();
+ }
+@@ -1318,6 +1394,7 @@ app.on('before-quit', () => {
+   if (sessionWatcher) { sessionWatcher.close(); sessionWatcher = null; }
+   stopCodexWatcher();
+   stopCursorWatcher();
++  stopHookBridge();
+   releasePowerBlockers();
+ });
+ 
+@@ -1337,7 +1414,7 @@ app.whenReady().then(() => {
+   // Clean up stale Codex false-positive entries left behind by older builds.
+   try {
+     if (fs.existsSync(SESSIONS_FILE)) {
+-      const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
++      const data = store.readSessions(SESSIONS_FILE);
+       let removed = false;
+       for (const key of Object.keys(data.sessions || {})) {
+         if (key.endsWith(':auto-detected')) { delete data.sessions[key]; removed = true; }
+@@ -1346,7 +1423,7 @@ app.whenReady().then(() => {
+         // cause a false awake window on first launch after upgrade.
+         if (key === 'cursor:agent') { delete data.sessions[key]; removed = true; }
+       }
+-      if (removed) fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
++      if (removed) store.writeSessions(data, SESSIONS_FILE);
+     }
+   } catch {}
+ 
+diff --git a/package.json b/package.json
+index fecdb4c..1ab96c3 100644
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,8 @@
+   "author": "Stanley Projects",
+   "scripts": {
+     "start": "unset ELECTRON_RUN_AS_NODE && electron .",
+-    "build": "electron-builder --win"
++    "build": "electron-builder --win",
++    "test": "node --test"
+   },
+   "dependencies": {},
+   "devDependencies": {
+@@ -26,14 +27,16 @@
+       "index.html",
+       "styles.css",
+       "agent-hook.js",
++      "hook-bridge.js",
++      "session-store.js",
+       "assets/tray-active.png",
+       "assets/tray-inactive.png",
+       "assets/icon.png",
+       "assets/icon.ico"
+     ],
+-
+     "asarUnpack": [
+-      "agent-hook.js"
++      "agent-hook.js",
++      "session-store.js"
+     ],
+     "win": {
+       "target": "nsis",
+diff --git a/session-store.js b/session-store.js
+new file mode 100644
+index 0000000..ab47854
+--- /dev/null
++++ b/session-store.js
+@@ -0,0 +1,306 @@
++/**
++ * Session bookkeeping shared by everything that records agent activity.
++ *
++ * Three writers touch ~/.insomnia/agent-sessions.json:
++ *   - agent-hook.js, spawned by Claude Code / Codex on this PC for every hook event
++ *   - hook-bridge.js, inside the app, for hooks that arrive over HTTP from a dev
++ *     container (Claude Code running in Linux cannot run a Windows hook)
++ *   - main.js itself (Codex / Cursor transcript watchers)
++ * and main.js reads it to decide whether to hold the PC awake. Keeping the rules
++ * in one place means a session behaves the same wherever its hook came from.
++ *
++ * No Electron dependency: agent-hook.js runs this under ELECTRON_RUN_AS_NODE, and
++ * the tests run it under plain Node.
++ */
++
++'use strict';
++
++const fs = require('fs');
++const os = require('os');
++const path = require('path');
++
++const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
++const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
++
++// ── Timings ──────────────────────────────────────────────────────────────────
++// Any hook event keeps the session awake for this long on its own.
++const SESSION_TIMEOUT_MS = 3 * 60 * 1000;
++// Ceiling for staying awake through silence (no hook firing) — a long build, a
++// long test run, a long reply. Only ever applies while the agent process is
++// still alive and something says work is still in flight.
++const SESSION_TURN_GRACE_MS = 30 * 60 * 1000;
++// A dev-container session proves its Claude process is alive by heartbeat
++// (sent every 60s while a turn is open); allow two missed beats plus slack.
++const REMOTE_HEARTBEAT_TTL_MS = 150 * 1000;
++// Housekeeping: finished sessions are kept a day (so `stop_seen` survives
++// between turns), anything untouched for a week is dropped.
++const IDLE_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
++const STALE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
++const MAX_OPEN_TOOLS = 64;
++
++// ── File access ──────────────────────────────────────────────────────────────
++function sleepSync(ms) {
++  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {}
++}
++
++function readSessions(file = SESSIONS_FILE) {
++  // Writes are atomic (temp file + rename), so a parse failure normally means a
++  // writer from an older build caught mid-write. Retry briefly rather than
++  // treating the file as empty — writing an empty document back would wipe
++  // every other session.
++  for (let attempt = 0; attempt < 3; attempt++) {
++    let raw;
++    try {
++      raw = fs.readFileSync(file, 'utf8');
++    } catch (err) {
++      if (err && err.code === 'ENOENT') return { sessions: {} };
++      sleepSync(20);
++      continue;
++    }
++    try {
++      const data = JSON.parse(raw);
++      if (data && typeof data === 'object' && !Array.isArray(data)) {
++        if (!data.sessions || typeof data.sessions !== 'object' || Array.isArray(data.sessions)) data.sessions = {};
++        return data;
++      }
++      break;
++    } catch {
++      sleepSync(20);
++    }
++  }
++  return { sessions: {} };
++}
++
++function renameWithRetry(from, to) {
++  // On Windows a rename over a file another process has open can fail
++  // transiently (antivirus, indexer). A few short retries cover that.
++  for (let attempt = 0; ; attempt++) {
++    try { fs.renameSync(from, to); return; }
++    catch (err) {
++      const transient = err && ['EPERM', 'EBUSY', 'EACCES'].includes(err.code);
++      if (!transient || attempt >= 4) throw err;
++      sleepSync(25 * (attempt + 1));
++    }
++  }
++}
++
++function writeSessions(data, file = SESSIONS_FILE) {
++  fs.mkdirSync(path.dirname(file), { recursive: true });
++  data.last_updated = new Date().toISOString();
++  const json = JSON.stringify(data, null, 2);
++  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
++  try {
++    fs.writeFileSync(tmp, json);
++    renameWithRetry(tmp, file);
++  } catch {
++    try { fs.unlinkSync(tmp); } catch {}
++    fs.writeFileSync(file, json); // last resort: non-atomic write
++  }
++}
++
++// Read, change, write. The mutator's return value is passed back.
++function updateSessions(mutator, file = SESSIONS_FILE) {
++  const data = readSessions(file);
++  const result = mutator(data);
++  writeSessions(data, file);
++  return result;
++}
++
++// ── Hook events ──────────────────────────────────────────────────────────────
++// How each Claude Code hook event moves a session along. Anything that is not
++// listed falls back to the command the hook was registered with (`stay-awake`
++// or `allow-sleep`), which is all older hook wiring and other tools provide.
++const EVENT_EFFECTS = {
++  UserPromptSubmit: 'new-turn',
++  PreToolUse: 'tool-start',
++  PostToolUse: 'tool-end',
++  PostToolUseFailure: 'tool-end',
++  PermissionRequest: 'activity',
++  // Notification also fires *after* a turn ends ("waiting for your input"), so it
++  // may refresh an open turn but must never open one. Earlier builds treated it
++  // as activity, which re-armed the long grace a minute after every turn.
++  Notification: 'touch',
++  Stop: 'end-turn',
++  StopFailure: 'end-turn',
++  SessionEnd: 'end-session'
++};
++
++function effectFor(event, command) {
++  if (event && EVENT_EFFECTS[event]) return EVENT_EFFECTS[event];
++  if (command === 'allow-sleep') return 'end-turn';
++  if (command === 'heartbeat') return 'heartbeat';
++  return 'activity';
++}
++
++function safeString(value, max = 200) {
++  return typeof value === 'string' && value.length > 0 ? value.slice(0, max) : '';
++}
++
++function lastSeenMs(session) {
++  return Math.max(
++    Date.parse(session.last_activity || '') || 0,
++    Date.parse(session.heartbeat_at || '') || 0,
++    Date.parse(session.created_at || '') || 0
++  );
++}
++
++function pruneSessions(data, now = Date.now()) {
++  for (const [key, s] of Object.entries(data.sessions || {})) {
++    if (!s || typeof s !== 'object') { delete data.sessions[key]; continue; }
++    const age = now - lastSeenMs(s);
++    if (age > STALE_SESSION_TTL_MS || (s.turn_open === false && age > IDLE_SESSION_TTL_MS)) {
++      delete data.sessions[key];
++    }
++  }
++}
++
++/**
++ * Apply one hook event to the sessions document (mutates `data`).
++ *
++ * @param {object} data      sessions document from readSessions()
++ * @param {object} opts
++ * @param {string} opts.integration  integration id, e.g. 'claude-code'
++ * @param {string} [opts.command]    'stay-awake' | 'allow-sleep' | 'heartbeat'
++ * @param {object} [opts.input]      the hook's JSON input (session_id, hook_event_name, tool_use_id, ...)
++ * @param {number} [opts.now]        ms timestamp, for tests
++ * @param {string} [opts.origin]     'local' (this PC) or where a bridged hook came from, e.g. 'devcontainer'
++ * @param {string} [opts.host]       hostname the bridged hook came from
++ * @returns {{ key: string, session: object|null, effect: string }}
++ */
++function applyHookEvent(data, { integration, command = 'stay-awake', input = {}, now = Date.now(), origin = 'local', host = '' } = {}) {
++  if (!data.sessions || typeof data.sessions !== 'object') data.sessions = {};
++  const safeInput = input && typeof input === 'object' ? input : {};
++  const sessionId = safeString(safeInput.session_id) || 'default';
++  const key = `${integration}:${sessionId}`;
++  const event = safeString(safeInput.hook_event_name, 64);
++  const toolId = safeString(safeInput.tool_use_id);
++  const effect = effectFor(event, command);
++  const nowIso = new Date(now).toISOString();
++
++  pruneSessions(data, now);
++
++  if (effect === 'end-session') {
++    delete data.sessions[key];
++    return { key, session: null, effect };
++  }
++
++  let s = data.sessions[key];
++  // These only ever annotate a session that already exists. (An end-turn does
++  // create one: a closed session holds nothing awake, and it records that this
++  // session fires Stop before its next turn begins.)
++  if (!s && (effect === 'touch' || effect === 'heartbeat')) {
++    return { key, session: null, effect };
++  }
++  if (!s) {
++    s = data.sessions[key] = { integration, session_id: sessionId, created_at: nowIso };
++  }
++  if (!s.open_tools || typeof s.open_tools !== 'object') s.open_tools = {};
++  s.origin = safeString(origin, 32) || 'local';
++  const safeHost = safeString(host, 64);
++  if (safeHost) s.host = safeHost;
++
++  switch (effect) {
++    case 'new-turn':
++      // A new prompt means the previous turn is over, whatever was left open
++      // by an interrupted tool call.
++      s.turn_open = true;
++      s.open_tools = {};
++      s.last_activity = nowIso;
++      break;
++    case 'tool-start':
++      s.turn_open = true;
++      if (toolId && Object.keys(s.open_tools).length < MAX_OPEN_TOOLS) s.open_tools[toolId] = nowIso;
++      s.last_activity = nowIso;
++      break;
++    case 'tool-end':
++      if (toolId) delete s.open_tools[toolId];
++      // A late tool-end must not reopen a turn that has already ended.
++      if (s.turn_open !== false) s.last_activity = nowIso;
++      break;
++    case 'touch':
++      if (s.turn_open !== false) s.last_activity = nowIso;
++      break;
++    case 'end-turn':
++      s.turn_open = false;
++      s.open_tools = {};
++      s.last_activity = nowIso;
++      s.ended_at = nowIso;
++      // Proof that this session reports the end of its turns. Until a session
++      // has shown that, an open turn on its own is not trusted to mean "still
++      // working": the Stop hook has been reported not to fire in the VS Code
++      // extension, and trusting it there would hold the PC awake for the whole
++      // grace window after every turn.
++      if (event === 'Stop') s.stop_seen = true;
++      break;
++    case 'heartbeat':
++      s.heartbeat_at = nowIso;
++      break;
++    default: // 'activity'
++      s.turn_open = true;
++      s.last_activity = nowIso;
++  }
++
++  return { key, session: s, effect };
++}
++
++// ── Decisions ────────────────────────────────────────────────────────────────
++function hasOpenTools(session) {
++  return !!session && !!session.open_tools && Object.keys(session.open_tools).length > 0;
++}
++
++function isRemoteSession(session) {
++  return !!session && !!session.origin && session.origin !== 'local';
++}
++
++// Is the agent process behind this session still running? Local sessions use
++// the caller's process check (claude.exe in tasklist); a dev container is
++// invisible to Windows, so its sessions rely on heartbeats.
++function isSessionAlive(session, now, localProcessAlive) {
++  if (isRemoteSession(session)) {
++    const beat = Date.parse(session.heartbeat_at || '');
++    return Number.isFinite(beat) && now - beat < REMOTE_HEARTBEAT_TTL_MS;
++  }
++  return !!localProcessAlive;
++}
++
++/**
++ * Should this turn-tracked session (Claude Code) hold the PC awake right now?
++ *
++ *  1. A turn that has ended (Stop / StopFailure) never does.
++ *  2. Any hook event in the last 3 minutes does.
++ *  3. Beyond that, and only up to 30 minutes of silence, while the agent
++ *     process is still alive:
++ *       - a tool call is still running (PreToolUse seen, PostToolUse not yet) —
++ *         a long build or test run, where no hook fires until it finishes; or
++ *       - the turn is still open in a session that has already shown it fires
++ *         Stop at the end of its turns (covers a long reply with no tool use).
++ */
++function isTurnSessionActive(session, now = Date.now(), localProcessAlive = false) {
++  if (!session || session.turn_open === false) return false;
++  const last = Date.parse(session.last_activity || '');
++  if (!Number.isFinite(last)) return false;
++  const silence = now - last;
++  if (silence < SESSION_TIMEOUT_MS) return true;
++  if (silence >= SESSION_TURN_GRACE_MS) return false;
++  if (!isSessionAlive(session, now, localProcessAlive)) return false;
++  return hasOpenTools(session) || session.stop_seen === true;
++}
++
++module.exports = {
++  SESSIONS_DIR,
++  SESSIONS_FILE,
++  SESSION_TIMEOUT_MS,
++  SESSION_TURN_GRACE_MS,
++  REMOTE_HEARTBEAT_TTL_MS,
++  IDLE_SESSION_TTL_MS,
++  STALE_SESSION_TTL_MS,
++  readSessions,
++  writeSessions,
++  updateSessions,
++  applyHookEvent,
++  pruneSessions,
++  hasOpenTools,
++  isRemoteSession,
++  isSessionAlive,
++  isTurnSessionActive
++};
+diff --git a/test/hook-bridge.test.js b/test/hook-bridge.test.js
+new file mode 100644
+index 0000000..0a0f4e9
+--- /dev/null
++++ b/test/hook-bridge.test.js
+@@ -0,0 +1,218 @@
++// Dev container path, end to end on Linux: the container-side hook script
++// (devcontainer-features/…/claude-hook.sh) talking to the bridge Insomnia runs
++// on the host. Run with: npm test
++'use strict';
++
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('fs');
++const os = require('os');
++const path = require('path');
++const http = require('http');
++const { spawn, spawnSync } = require('child_process');
++const { createHookBridge } = require('../hook-bridge');
++const store = require('../session-store');
++
++const HOOK = path.join(__dirname, '..', 'devcontainer-features', 'src', 'claude-code-stay-awake', 'claude-hook.sh');
++const sleep = ms => new Promise(r => setTimeout(r, ms));
++// The container-side script is POSIX sh and reads /proc: Linux only.
++const linuxOnly = { skip: process.platform !== 'linux' || !fs.existsSync('/bin/bash') ? 'needs Linux' : false };
++
++async function startBridge(t, { enabled = true } = {}) {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'insomnia-bridge-'));
++  const sessionsFile = path.join(dir, 'agent-sessions.json');
++  let activity = 0;
++  const bridge = createHookBridge({
++    port: 0,
++    sessionsFile,
++    isEnabled: () => enabled,
++    onActivity: () => { activity++; },
++    version: 'test'
++  });
++  bridge.start();
++  for (let i = 0; i < 100 && !bridge.listening; i++) await sleep(10);
++  assert.ok(bridge.listening, 'bridge should listen');
++  t.after(() => { bridge.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
++  return { bridge, dir, sessionsFile, port: bridge.address.port, activity: () => activity };
++}
++
++function request(port, { method = 'POST', urlPath = '/v1/hooks/claude-code', headers = {}, body = '' } = {}) {
++  return new Promise((resolve, reject) => {
++    const req = http.request({ host: '127.0.0.1', port, method, path: urlPath, headers }, res => {
++      let data = '';
++      res.on('data', c => { data += c; });
++      res.on('end', () => resolve({ status: res.statusCode, body: data }));
++    });
++    req.on('error', reject);
++    req.end(body);
++  });
++}
++
++const json = { 'Content-Type': 'application/json' };
++
++test('bridge records a hook posted as JSON and answers in key=value lines', async t => {
++  const { port, sessionsFile } = await startBridge(t);
++  const res = await request(port, {
++    headers: { ...json, 'X-Insomnia-Origin': 'devcontainer', 'X-Insomnia-Host': 'abc123' },
++    body: JSON.stringify({ session_id: 'sess-1', hook_event_name: 'PreToolUse', tool_use_id: 'toolu_1', tool_input: { command: 'make' } })
++  });
++  assert.equal(res.status, 200);
++  assert.match(res.body, /session=sess-1/);
++  assert.match(res.body, /turn=open/);
++  const s = store.readSessions(sessionsFile).sessions['claude-code:sess-1'];
++  assert.equal(s.origin, 'devcontainer');
++  assert.equal(s.host, 'abc123');
++  assert.ok(s.open_tools.toolu_1);
++});
++
++test('bridge refuses browsers, foreign host names and non-JSON bodies', async t => {
++  const { port } = await startBridge(t);
++  const body = JSON.stringify({ session_id: 'x', hook_event_name: 'UserPromptSubmit' });
++  assert.equal((await request(port, { headers: { ...json, Origin: 'https://evil.example' }, body })).status, 403);
++  assert.equal((await request(port, { headers: { ...json, Host: 'evil.example:47391' }, body })).status, 403);
++  assert.equal((await request(port, { headers: { 'Content-Type': 'text/plain' }, body })).status, 415);
++  assert.equal((await request(port, { headers: json, body: '{not json' })).status, 400);
++  assert.equal((await request(port, { urlPath: '/v1/hooks/unknown', headers: json, body })).status, 404);
++  assert.equal((await request(port, { method: 'GET', headers: json })).status, 405);
++  // host.docker.internal is how a container reaches it
++  assert.equal((await request(port, { headers: { ...json, Host: `host.docker.internal:${port}` }, body })).status, 200);
++});
++
++test('a bridged session can never pose as local', async t => {
++  const { port, sessionsFile } = await startBridge(t);
++  await request(port, { headers: { ...json, 'X-Insomnia-Origin': 'local' }, body: JSON.stringify({ session_id: 'p', hook_event_name: 'UserPromptSubmit' }) });
++  assert.equal(store.readSessions(sessionsFile).sessions['claude-code:p'].origin, 'remote');
++});
++
++test('bridge ignores events while the integration is disabled', async t => {
++  const { port, sessionsFile } = await startBridge(t, { enabled: false });
++  const res = await request(port, { headers: json, body: JSON.stringify({ session_id: 'd', hook_event_name: 'UserPromptSubmit' }) });
++  assert.match(res.body, /ignored=disabled/);
++  assert.equal(fs.existsSync(sessionsFile), false);
++});
++
++test('ping reports the app', async t => {
++  const { port } = await startBridge(t);
++  const res = await request(port, { method: 'GET', urlPath: '/v1/ping' });
++  assert.equal(res.status, 200);
++  assert.deepEqual(JSON.parse(res.body), { app: 'insomnia', version: 'test', integrations: { 'claude-code': true } });
++});
++
++// ── The container-side hook script ───────────────────────────────────────────
++// Runs the hook the way Claude Code would: as a child of a process named
++// "claude" (a copy of bash), with the event JSON on stdin.
++function makeFakeClaude(dir) {
++  const fake = path.join(dir, 'claude');
++  fs.copyFileSync('/bin/bash', fake);
++  fs.chmodSync(fake, 0o755);
++  return fake;
++}
++
++function hookEnv(port, stateDir) {
++  return {
++    ...process.env,
++    INSOMNIA_URL: `http://127.0.0.1:${port}`,
++    INSOMNIA_HEARTBEAT_INTERVAL: '1',
++    REMOTE_CONTAINERS: 'true', // what VS Code sets inside a dev container
++    TMPDIR: stateDir
++  };
++}
++
++function runHook(fakeClaude, env, event) {
++  // `claude -c '…'` → sh -c → hook, like Claude Code's shell form.
++  const r = spawnSync(fakeClaude, ['-c', `printf '%s' "$EVT" | sh -c '${HOOK}'`], {
++    env: { ...env, EVT: JSON.stringify(event) },
++    encoding: 'utf8',
++    timeout: 10000
++  });
++  return r;
++}
++
++test('container hook: forwards events, prints nothing, exits 0 — even with no Insomnia listening', linuxOnly, async t => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'insomnia-hook-'));
++  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
++  const fake = makeFakeClaude(dir);
++  // Port 9 (discard) is closed: the hook must shrug it off quickly.
++  const started = Date.now();
++  const r = runHook(fake, hookEnv(9, dir), { session_id: 'nobody', hook_event_name: 'Stop' });
++  assert.equal(r.status, 0);
++  assert.equal(r.stdout, '');
++  assert.ok(Date.now() - started < 4000, 'unreachable host must not stall Claude');
++});
++
++test('container hook: full turn with a long tool call keeps heartbeats coming until Stop', linuxOnly, async t => {
++  const { port, sessionsFile } = await startBridge(t);
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'insomnia-hook-'));
++  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
++  const fake = makeFakeClaude(dir);
++  const env = hookEnv(port, dir);
++  const sid = '0b3c5c2e-1111-4222-8333-944455556666';
++  const key = `claude-code:${sid}`;
++
++  // A long-lived "claude" that runs the hooks as its children.
++  const big = 'x'.repeat(100000); // PostToolUse inputs carry tool output
++  const script = [
++    `ev() { printf '%s' "$1" | sh -c '${HOOK}'; }`,
++    `ev '${JSON.stringify({ session_id: sid, hook_event_name: 'UserPromptSubmit', prompt: 'build it' })}'`,
++    `ev '${JSON.stringify({ session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'make' }, tool_use_id: 'toolu_build' })}'`,
++    'sleep 3.5', // the "build": no hook fires, heartbeat should
++    `ev '${JSON.stringify({ session_id: sid, hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: 'make' }, tool_response: { stdout: big }, tool_use_id: 'toolu_build' })}'`,
++    `ev '${JSON.stringify({ session_id: sid, hook_event_name: 'Stop', stop_hook_active: false })}'`,
++    'sleep 3' // claude stays open after the turn; heartbeats must stop
++  ].join('\n');
++  const claude = spawn(fake, ['-c', script], { env, stdio: ['ignore', 'pipe', 'pipe'] });
++  let stdout = '';
++  claude.stdout.on('data', d => { stdout += d; });
++
++  // During the build: turn open, tool open, heartbeat arriving.
++  await sleep(2600);
++  let s = store.readSessions(sessionsFile).sessions[key];
++  assert.ok(s, 'session recorded');
++  assert.equal(s.origin, 'devcontainer');
++  assert.equal(s.turn_open, true);
++  assert.ok(s.open_tools.toolu_build, 'build is an open tool call');
++  assert.ok(s.heartbeat_at, 'heartbeat received while the tool runs');
++  assert.ok(Date.now() - Date.parse(s.heartbeat_at) < 2500);
++  const hbPid = Number(fs.readFileSync(path.join(dir, `insomnia-${process.getuid()}`, `heartbeat-${sid}.pid`), 'utf8'));
++  assert.ok(hbPid > 0);
++
++  await new Promise(r => claude.on('exit', r));
++  assert.equal(stdout, '', 'hooks print nothing');
++  s = store.readSessions(sessionsFile).sessions[key];
++  assert.equal(s.turn_open, false, 'Stop closed the turn');
++  assert.equal(s.stop_seen, true);
++  assert.deepEqual(s.open_tools, {}, 'PostToolUse with a 100 KB body closed the tool');
++  // Heartbeat process gone after the turn ended.
++  await sleep(1500);
++  assert.equal(processExists(hbPid), false, 'heartbeat stopped after Stop');
++});
++
++test('container hook: heartbeat stops when the claude process dies mid-turn', linuxOnly, async t => {
++  const { port, sessionsFile } = await startBridge(t);
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'insomnia-hook-'));
++  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
++  const fake = makeFakeClaude(dir);
++  const sid = 'crash-session';
++  const script = [
++    `printf '%s' '${JSON.stringify({ session_id: sid, hook_event_name: 'PreToolUse', tool_use_id: 't1' })}' | sh -c '${HOOK}'`,
++    'sleep 30'
++  ].join('\n');
++  const claude = spawn(fake, ['-c', script], { env: hookEnv(port, dir), stdio: 'ignore' });
++  await sleep(1500);
++  const pidFile = path.join(dir, `insomnia-${process.getuid()}`, `heartbeat-${sid}.pid`);
++  const hbPid = Number(fs.readFileSync(pidFile, 'utf8'));
++  assert.ok(processExists(hbPid));
++  claude.kill('SIGKILL'); // the container's claude crashes, no Stop
++  await sleep(2500);
++  assert.equal(processExists(hbPid), false, 'heartbeat noticed claude is gone');
++  const s = store.readSessions(sessionsFile).sessions[`claude-code:${sid}`];
++  // Host side: heartbeats have stopped, so once the 3-minute window passes the
++  // session no longer counts, even with the tool call still "open".
++  assert.equal(store.isTurnSessionActive(s, Date.parse(s.last_activity) + 4 * 60 * 1000, true), false);
++});
++
++function processExists(pid) {
++  try { process.kill(pid, 0); } catch { return false; }
++  // A zombie still "exists"; check its state.
++  try { return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; }
++}
+diff --git a/test/session-store.test.js b/test/session-store.test.js
+new file mode 100644
+index 0000000..6a89c1b
+--- /dev/null
++++ b/test/session-store.test.js
+@@ -0,0 +1,169 @@
++// Decision table for Claude Code sessions. Run with: npm test
++'use strict';
++
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('fs');
++const os = require('os');
++const path = require('path');
++const store = require('../session-store');
++
++const MIN = 60 * 1000;
++const T0 = Date.parse('2026-10-07T12:00:00Z');
++
++// Feed a list of [minutesAfterT0, hookEventName, extra] into a fresh document.
++function replay(events, { origin = 'local', sessionId = 's1' } = {}) {
++  const data = { sessions: {} };
++  for (const [minute, event, extra = {}] of events) {
++    const command = ['Stop', 'StopFailure', 'SessionEnd'].includes(event) ? 'allow-sleep' : 'stay-awake';
++    store.applyHookEvent(data, {
++      integration: 'claude-code',
++      command,
++      input: { session_id: sessionId, hook_event_name: event, ...extra },
++      now: T0 + minute * MIN,
++      origin
++    });
++  }
++  return data;
++}
++
++function active(data, minute, processAlive, key = 'claude-code:s1') {
++  return store.isTurnSessionActive(data.sessions[key], T0 + minute * MIN, processAlive);
++}
++
++test('a 10-minute build stays awake even before the session has ever fired Stop', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 'build' }]]);
++  assert.equal(active(d, 11, true), true);
++  assert.equal(active(d, 25, true), true);
++});
++
++test('a running tool is not trusted once claude.exe is gone', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 'build' }]]);
++  assert.equal(active(d, 11, false), false);
++});
++
++test('long tool calls are capped at 30 minutes of silence', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [0, 'PreToolUse', { tool_use_id: 'build' }]]);
++  assert.equal(active(d, 29, true), true);
++  assert.equal(active(d, 31, true), false);
++});
++
++test('Stop releases immediately', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 't' }], [2, 'PostToolUse', { tool_use_id: 't' }], [3, 'Stop']]);
++  assert.equal(active(d, 3, true), false);
++});
++
++test('StopFailure (turn ended by an API error) releases immediately', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'StopFailure']]);
++  assert.equal(active(d, 1, true), false);
++});
++
++test('without Stop (reported in the VS Code extension) an idle session releases after 3 minutes, not 30', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 't' }], [2, 'PostToolUse', { tool_use_id: 't' }]]);
++  assert.equal(active(d, 4, true), true);
++  assert.equal(active(d, 5.5, true), false);
++});
++
++test('once a session has fired Stop, an open turn is trusted for a long reply', () => {
++  const d = replay([
++    [0, 'UserPromptSubmit'], [1, 'Stop'],
++    [10, 'UserPromptSubmit'] // second turn: long thinking, no tool yet
++  ]);
++  assert.equal(active(d, 20, true), true);
++  assert.equal(active(d, 41, true), false); // still capped
++  assert.equal(active(d, 20, false), false); // and needs the process
++});
++
++test('a Notification after the turn ended does not re-arm anything', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'Stop'], [2, 'Notification']]);
++  assert.equal(active(d, 2, true), false);
++  assert.equal(active(d, 10, true), false);
++});
++
++test('a failed tool closes its tool call', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 't' }], [2, 'PostToolUseFailure', { tool_use_id: 't' }]]);
++  assert.equal(store.hasOpenTools(d.sessions['claude-code:s1']), false);
++  assert.equal(active(d, 10, true), false);
++});
++
++test('parallel tool calls: awake until the last one finishes', () => {
++  const d = replay([
++    [0, 'UserPromptSubmit'],
++    [1, 'PreToolUse', { tool_use_id: 'a' }], [1, 'PreToolUse', { tool_use_id: 'b' }],
++    [2, 'PostToolUse', { tool_use_id: 'a' }]
++  ]);
++  assert.equal(active(d, 12, true), true);
++});
++
++test('a new prompt clears tool calls left open by an interrupted turn', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 'x' }], [5, 'UserPromptSubmit']]);
++  assert.equal(store.hasOpenTools(d.sessions['claude-code:s1']), false);
++});
++
++test('a late PostToolUse does not reopen an ended turn', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 't' }], [2, 'Stop'], [2, 'PostToolUse', { tool_use_id: 't' }]]);
++  assert.equal(active(d, 2, true), false);
++});
++
++test('SessionEnd removes the session', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'SessionEnd']]);
++  assert.equal(d.sessions['claude-code:s1'], undefined);
++});
++
++test('legacy wiring without an event name still works (stay-awake / allow-sleep)', () => {
++  const data = { sessions: {} };
++  store.applyHookEvent(data, { integration: 'claude-code', command: 'stay-awake', input: { session_id: 's1' }, now: T0 });
++  assert.equal(active(data, 1, false), true);
++  store.applyHookEvent(data, { integration: 'claude-code', command: 'allow-sleep', input: { session_id: 's1' }, now: T0 + MIN });
++  assert.equal(active(data, 1, true), false);
++});
++
++// ── Dev container sessions ───────────────────────────────────────────────────
++test('dev container: a long build stays awake while heartbeats arrive, regardless of claude.exe', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 'build' }]], { origin: 'devcontainer' });
++  for (let m = 2; m <= 12; m++) {
++    store.applyHookEvent(d, { integration: 'claude-code', command: 'heartbeat', input: { session_id: 's1' }, now: T0 + m * MIN, origin: 'devcontainer' });
++  }
++  assert.equal(active(d, 12.5, false), true);
++});
++
++test('dev container: heartbeats stopping (container gone) releases within 2.5 minutes', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'PreToolUse', { tool_use_id: 'build' }]], { origin: 'devcontainer' });
++  store.applyHookEvent(d, { integration: 'claude-code', command: 'heartbeat', input: { session_id: 's1' }, now: T0 + 5 * MIN, origin: 'devcontainer' });
++  assert.equal(active(d, 7, false), true);
++  assert.equal(active(d, 8, true), false); // a local claude.exe does not keep a container session alive
++});
++
++test('a heartbeat never creates a session', () => {
++  const data = { sessions: {} };
++  store.applyHookEvent(data, { integration: 'claude-code', command: 'heartbeat', input: { session_id: 'ghost' }, now: T0, origin: 'devcontainer' });
++  assert.deepEqual(data.sessions, {});
++});
++
++// ── Housekeeping and file handling ───────────────────────────────────────────
++test('finished sessions are pruned after a day, untouched ones after a week', () => {
++  const d = replay([[0, 'UserPromptSubmit'], [1, 'Stop']]);
++  store.applyHookEvent(d, { integration: 'claude-code', input: { session_id: 'other', hook_event_name: 'UserPromptSubmit' }, now: T0 + 25 * 60 * MIN });
++  assert.equal(d.sessions['claude-code:s1'], undefined);
++  assert.ok(d.sessions['claude-code:other']);
++});
++
++test('updateSessions writes atomically and keeps other sessions', () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'insomnia-test-'));
++  const file = path.join(dir, 'agent-sessions.json');
++  store.updateSessions(d => store.applyHookEvent(d, { integration: 'codex-cli', input: { session_id: 'app-server' } }), file);
++  store.updateSessions(d => store.applyHookEvent(d, { integration: 'claude-code', input: { session_id: 'abc', hook_event_name: 'UserPromptSubmit' } }), file);
++  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
++  assert.ok(data.sessions['codex-cli:app-server']);
++  assert.ok(data.sessions['claude-code:abc']);
++  assert.deepEqual(fs.readdirSync(dir), ['agent-sessions.json']); // no temp files left behind
++  fs.rmSync(dir, { recursive: true, force: true });
++});
++
++test('a corrupt sessions file reads as empty instead of throwing', () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'insomnia-test-'));
++  const file = path.join(dir, 'agent-sessions.json');
++  fs.writeFileSync(file, '{"sessions": {');
++  assert.deepEqual(store.readSessions(file), { sessions: {} });
++  fs.rmSync(dir, { recursive: true, force: true });
++});
+-- 
+2.43.0
+
