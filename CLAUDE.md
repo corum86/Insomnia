@@ -36,7 +36,30 @@ Suggested note format:
 - [AgentName] What changed. Why it changed. Any follow-up note.
 ```
 
+## Building
+
+`npm run build` runs `electron-builder --win` and writes the installer to `dist/`. `npx electron .` only starts the app in dev mode and never packages it, so the build can fail even when that works.
+
+### First build fails: "Cannot create symbolic link : A required privilege is not held by the client"
+
+electron-builder downloads `winCodeSign-2.6.0.7z`. It needs `rcedit` from that archive to set the icon and version info on `Insomnia.exe`. It unpacks the archive into `%LOCALAPPDATA%\electron-builder\Cache\winCodeSign`. The archive also holds two macOS symlinks (`darwin\10.12\lib\libcrypto.dylib` and `libssl.dylib`), and Windows lets only admins create symlinks unless Developer Mode is on. 7-Zip fails on those two files, and electron-builder retries four times, then gives up. Fix it once per machine:
+
+1. **Recommended: run one build from an elevated terminal.** Open PowerShell or VS Code as Administrator and run `npm run build`. The unpacked toolchain is then cached in `...\Cache\winCodeSign\winCodeSign-2.6.0`, so later builds run without admin. Repeat this only if that cache folder is deleted or electron-builder moves to a newer winCodeSign version.
+2. **Alternative: turn on Developer Mode** (Settings → System → For developers). Normal users can then create symlinks, so every build works without admin, including after the cache is cleared.
+3. **Alternative without admin: fill the cache by hand.** Unpack one of the downloaded archives into the folder name electron-builder looks for. The two symlink errors are expected and harmless, since a Windows build never uses the macOS files:
+   ```powershell
+   $c = "$env:LOCALAPPDATA\electron-builder\Cache\winCodeSign"
+   & .\node_modules\7zip-bin\win\x64\7za.exe x -bd (Get-ChildItem "$c\*.7z" | Select-Object -First 1).FullName "-o$c\winCodeSign-2.6.0"
+   ```
+
+After any fix, delete the leftover numbered `.7z` files and folders in that cache folder.
+
+Don't set `signAndEditExecutable: false` to get around this: the build would succeed, but the exe would lose its icon and version info.
+
 ## Agent Log
+
+### 2026-10-08
+- [Claude] Dev container setup from the app: a cog on the Claude Code trigger opens a "Dev containers" panel. **Add project folder…** finds `.devcontainer/devcontainer.json` (plus every `.devcontainer/<name>/devcontainer.json`), copies the bundled feature into `claude-code-stay-awake/` next to it, and adds `"./claude-code-stay-awake": {}` (with `bridgePort` only if it isn't the default). New `devcontainer-setup.js`, which has no Electron dependency, edits the JSONC as text so comments and formatting survive. It never adds the local copy when the published `ghcr.io/.../claude-code-stay-awake` is already referenced, and never overwrites or deletes a folder whose `devcontainer-feature.json` id isn't ours. Files are written with LF plus a `.gitattributes` (`eol=lf`), because a CRLF `install.sh` breaks inside the container. It warns when the config folder has an `init-firewall.sh` that doesn't mention the bridge port. Projects are kept in `config.devcontainerProjects` with status ok/outdated/published/missing; Update rewrites the files, and × asks whether to remove the feature from the project or only forget it. A root-level `.devcontainer.json` is refused with a message, because local features must live inside `.devcontainer/`. The feature folder was added to `build.files`. Tests: `test/devcontainer-setup.test.js` (10 cases). The UI was checked in a sandboxed Electron run (temp USERPROFILE, `--user-data-dir`), driven over CDP. The two native dialogs (folder picker, remove confirmation) were not clicked through.
 
 ### 2026-10-07
 - [Claude] Claude Code in the VS Code extension and in dev containers. Not built or run on Windows yet; everything below was verified on Linux (unit tests, a real Claude Code 2.1.293 binary against a mock API, and main.js booted with a stubbed Electron). Needs a Windows check before release: hooks firing from the VS Code extension, and a dev container reaching the bridge.
